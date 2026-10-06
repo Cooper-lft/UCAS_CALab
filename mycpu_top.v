@@ -45,7 +45,7 @@ IF_stage u_IF_stage (
     );
 
 wire         EX_allowin;
-wire [151:0] ID_to_EX_bus;
+wire [157:0] ID_to_EX_bus;
 wire         ID_to_EX_valid;
 wire         WB_rf_we;
 wire [  4:0] WB_rf_waddr;
