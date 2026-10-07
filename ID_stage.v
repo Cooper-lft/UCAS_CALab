@@ -6,7 +6,7 @@ module ID_stage (
     input  wire [63:0] IF_to_ID_bus,
     
     input  wire        EX_allowin,
-    output wire [157:0] ID_to_EX_bus,
+    output wire [160:0] ID_to_EX_bus,
     output wire        ID_to_EX_valid,
     
     output wire        ID_allowin,
@@ -96,6 +96,8 @@ wire        ID_data_sram_en;
 wire        ID_is_div;      // 除法或取余指令
 wire        ID_div_signed;  // 有符号运算(求商或者取余)
 wire        ID_div_is_mod;  // 选择余数，否则选择商
+wire [ 1:0] ID_mem_size;    // 00为字，01为字节，10为半字
+wire        ID_load_u;      // 进行零扩展
 
 assign ID_to_EX_bus = {ID_pc,
                        ID_rf_we,
@@ -109,7 +111,9 @@ assign ID_to_EX_bus = {ID_pc,
                        ID_data_sram_en,
                        ID_is_div,
                        ID_div_signed,
-                       ID_div_is_mod};
+                       ID_div_is_mod,
+                       ID_mem_size,
+                       ID_load_u};
 
 
 // decode
@@ -180,6 +184,20 @@ wire        inst_mod_wu;
 wire        inst_mul;
 wire        inst_mulh;
 wire        inst_mulhu;
+wire        inst_blt;
+wire        inst_bge;
+wire        inst_bltu;
+wire        inst_bgeu;
+wire        inst_st_b;
+wire        inst_st_h;
+wire        inst_ld_b;
+wire        inst_ld_h;
+wire        inst_ld_bu;
+wire        inst_ld_hu;
+
+wire        inst_cond_branch;
+wire        inst_store;
+wire        inst_load;
 
 wire        need_ui5;
 wire        need_ui12;
@@ -195,6 +213,8 @@ wire [ 4:0] rf_raddr2;
 wire [31:0] rf_rdata2;
 
 wire        rj_eq_rd;
+wire        rj_lt_rd;       // 有符号小于
+wire        rj_ltu_rd;      // 无符号小于
 
 // 检查数据冲突
 wire [ 4:0] WB_dest;
@@ -277,8 +297,24 @@ assign inst_mod_wu = op_31_26_d[6'h00] & op_25_22_d[4'h0] & op_21_20_d[2'h2] & o
 assign inst_mul    = op_31_26_d[6'h00] & op_25_22_d[4'h0] & op_21_20_d[2'h1] & op_19_15_d[5'h18];
 assign inst_mulh   = op_31_26_d[6'h00] & op_25_22_d[4'h0] & op_21_20_d[2'h1] & op_19_15_d[5'h19];
 assign inst_mulhu  = op_31_26_d[6'h00] & op_25_22_d[4'h0] & op_21_20_d[2'h1] & op_19_15_d[5'h1a];
+// exp11:
+assign inst_blt    = op_31_26_d[6'h18];
+assign inst_bge    = op_31_26_d[6'h19];
+assign inst_bltu   = op_31_26_d[6'h1a];
+assign inst_bgeu   = op_31_26_d[6'h1b];
+assign inst_st_b   = op_31_26_d[6'h0a] & op_25_22_d[4'h4];
+assign inst_st_h   = op_31_26_d[6'h0a] & op_25_22_d[4'h5];
+assign inst_ld_b   = op_31_26_d[6'h0a] & op_25_22_d[4'h0];
+assign inst_ld_h   = op_31_26_d[6'h0a] & op_25_22_d[4'h1];
+assign inst_ld_bu  = op_31_26_d[6'h0a] & op_25_22_d[4'h8];
+assign inst_ld_hu  = op_31_26_d[6'h0a] & op_25_22_d[4'h9];
+
+assign inst_cond_branch = inst_beq  | inst_bne  | inst_blt  | inst_bge   | inst_bltu  | inst_bgeu;
+assign inst_store       = inst_st_w | inst_st_b | inst_st_h;
+assign inst_load        = inst_ld_w | inst_ld_b | inst_ld_h | inst_ld_bu | inst_ld_hu;
+
 //---------------------------------------
-assign ID_alu_op[ 0] = inst_add_w | inst_addi_w | inst_ld_w | inst_st_w
+assign ID_alu_op[ 0] = inst_add_w | inst_addi_w | inst_load | inst_store
                     | inst_jirl | inst_bl | inst_pcaddu12i;
 assign ID_alu_op[ 1] = inst_sub_w;
 assign ID_alu_op[ 2] = inst_slt | inst_slti;
@@ -297,8 +333,8 @@ assign ID_alu_op[14] = inst_mulhu;
 // 立即数
 assign need_ui5   =  inst_slli_w | inst_srli_w | inst_srai_w;
 assign need_ui12  =  inst_andi | inst_ori | inst_xori;
-assign need_si12  =  inst_addi_w | inst_ld_w | inst_st_w | inst_slti | inst_sltui;
-assign need_si16  =  inst_jirl | inst_beq | inst_bne;
+assign need_si12  =  inst_addi_w | inst_load | inst_store | inst_slti | inst_sltui;
+assign need_si16  =  inst_jirl | inst_cond_branch;
 assign need_si20  =  inst_lu12i_w | inst_pcaddu12i;
 assign need_si26  =  inst_b | inst_bl;
 assign src2_is_4  =  inst_jirl | inst_bl;
@@ -314,7 +350,7 @@ assign br_offs = need_si26 ? {{ 4{i26[25]}}, i26[25:0], 2'b0} :
 
 assign jirl_offs = {{14{i16[15]}}, i16[15:0], 2'b0};
 
-assign src_reg_is_rd = inst_beq | inst_bne | inst_st_w;
+assign src_reg_is_rd = inst_cond_branch | inst_store;
 
 assign src1_is_pc    = inst_jirl | inst_bl | inst_pcaddu12i;
 assign src1_is_0     = inst_lu12i_w;    // lu12i指令的alu的操作数1应该是0而不是pc或者是寄存器的值，操作数2是立即数
@@ -328,19 +364,19 @@ assign src2_is_imm   = inst_slli_w |
                        inst_andi   |
                        inst_ori    |
                        inst_xori   |
-                       inst_ld_w   |
-                       inst_st_w   |
+                       inst_load   |
+                       inst_store  |
                        inst_lu12i_w|
                        inst_pcaddu12i |
                        inst_jirl   |
                        inst_bl     ;
 
-assign ID_sel_rf_res    = inst_ld_w;
+assign ID_sel_rf_res    = inst_load;
 assign dst_is_r1        = inst_bl;
 
 // 涉及寄存器堆写操作
-assign gr_we            = ~inst_st_w & ~inst_beq & ~inst_bne & ~inst_b;
-assign mem_we           = inst_st_w;
+assign gr_we            = ~inst_store & ~inst_cond_branch & ~inst_b;
+assign mem_we           = inst_store;
 assign ID_dest          = dst_is_r1 ? 5'd1 : rd;
 assign ID_rf_we         = gr_we && ID_valid;
 
@@ -358,14 +394,20 @@ regfile u_regfile(
     );
 
 
-assign rj_eq_rd = (rj_value_mem_wb == rkd_value_mem_wb);
-assign br_taken = (   inst_beq  &&  rj_eq_rd
-                   || inst_bne  && !rj_eq_rd
-                   || inst_jirl
-                   || inst_bl
-                   || inst_b
-                  ) && ID_valid && ID_readygo && EX_allowin; // 注意只有在ID级指令能流向EX级时，br_taken才可能有效
-assign br_target = (inst_beq || inst_bne || inst_bl || inst_b) ? (ID_pc + br_offs) :
+assign rj_eq_rd  = (rj_value_mem_wb == rkd_value_mem_wb);
+assign rj_lt_rd  = ($signed(rj_value_mem_wb) < $signed(rkd_value_mem_wb));
+assign rj_ltu_rd = (rj_value_mem_wb < rkd_value_mem_wb);
+assign br_taken  = (   inst_beq  &&  rj_eq_rd
+                    || inst_bne  &&  !rj_eq_rd
+                    || inst_blt  &&  rj_lt_rd
+                    || inst_bge  &&  !rj_lt_rd
+                    || inst_bltu &&  rj_ltu_rd
+                    || inst_bgeu &&  !rj_ltu_rd
+                    || inst_jirl
+                    || inst_bl
+                    || inst_b
+                   ) && ID_valid && ID_readygo && EX_allowin; // 注意只有在ID级指令能流向EX级时，br_taken才可能有效
+assign br_target = (inst_cond_branch || inst_bl || inst_b) ? (ID_pc + br_offs) :
                                                    /*inst_jirl*/ (rj_value_mem_wb + jirl_offs);
 // 复用原有MEM,WB前递通路，涉及前递的跳转指令的寄存器值只用MEM,WB级前递结果和寄存器堆的结果，不用EX级结果，避免时序违例
 assign rj_value_mem_wb  = (MEM_forward_src1) ? MEM_wdata_forward :
@@ -380,8 +422,12 @@ assign ID_alu_src1 = (src1_is_pc) ? ID_pc[31:0] :
 assign ID_alu_src2 = (src2_is_imm)? imm   : rkd_value;
 
 assign ID_data_sram_we      = {4{mem_we && ID_valid}};
-assign ID_data_sram_en      = ID_valid && (inst_st_w || inst_ld_w); 
+assign ID_data_sram_en      = ID_valid && (inst_store || inst_load); 
 assign ID_data_sram_wdata   = rkd_value;
+assign ID_mem_size          = (inst_ld_b | inst_ld_bu | inst_st_b) ? 2'b01 :
+                              (inst_ld_h | inst_ld_hu | inst_st_h) ? 2'b10 : 
+                               2'b00;
+assign ID_load_u            = inst_ld_bu | inst_ld_hu;
 
 // 除法相关的信号：
 assign ID_is_div     = inst_div_w | inst_div_wu | inst_mod_w | inst_mod_wu;
@@ -398,46 +444,45 @@ assign data_hazard = ID_valid && load_in_EX && (EX_dest != 5'b0) && (
                      );
 
 // 跳转指令中需要rj前递结果的（注意包含jirl）
-assign  br_need_rj = inst_beq || inst_bne || inst_jirl;
+assign  br_need_rj = inst_cond_branch || inst_jirl;
 // 跳转指令中需要rd前递结果的
-assign  br_need_rd = inst_beq || inst_bne;
+assign  br_need_rd = inst_cond_branch;
 // 如果涉及前递的跳转指令需要当前EX级的前递结果，则让ID级跳转指令阻塞
 assign  br_block   = ID_valid && EX_valid && EX_rf_we && (EX_dest != 5'b0) &&
                      ( (br_need_rj && (EX_dest == rj)) ||
                        (br_need_rd && (EX_dest == rd)) 
                      ); 
 
-assign rj_used = inst_add_w  |
-                 inst_sub_w  |
-                 inst_slt    |
-                 inst_sltu   |
-                 inst_nor    |
-                 inst_and    |
-                 inst_or     |
-                 inst_xor    |
-                 inst_slli_w |
-                 inst_srli_w |
-                 inst_srai_w |
-                 inst_addi_w |
-                 inst_slti   |
-                 inst_sltui  |
-                 inst_andi   |
-                 inst_ori    |
-                 inst_xori   |
-                 inst_sll_w  |
-                 inst_srl_w  |
-                 inst_sra_w  |
-                 inst_ld_w   |
-                 inst_st_w   |
-                 inst_jirl   |
-                 inst_beq    |
-                 inst_bne    |
-                 inst_div_w  | 
-                 inst_div_wu | 
-                 inst_mod_w  |
-                 inst_mod_wu |
-                 inst_mul    |
-                 inst_mulh   |
+assign rj_used = inst_add_w         |
+                 inst_sub_w         |
+                 inst_slt           |
+                 inst_sltu          |
+                 inst_nor           |
+                 inst_and           |
+                 inst_or            |
+                 inst_xor           |
+                 inst_slli_w        |
+                 inst_srli_w        |
+                 inst_srai_w        |
+                 inst_addi_w        |
+                 inst_slti          |
+                 inst_sltui         |
+                 inst_andi          |
+                 inst_ori           |
+                 inst_xori          |
+                 inst_sll_w         |
+                 inst_srl_w         |
+                 inst_sra_w         |
+                 inst_load          |
+                 inst_store         |
+                 inst_jirl          |
+                 inst_cond_branch   |
+                 inst_div_w         | 
+                 inst_div_wu        | 
+                 inst_mod_w         |
+                 inst_mod_wu        |
+                 inst_mul           |
+                 inst_mulh          |
                  inst_mulhu;
 
 assign rk_used = inst_add_w  |
@@ -459,9 +504,7 @@ assign rk_used = inst_add_w  |
                  inst_mulh   |
                  inst_mulhu;                
 
-assign rd_used = inst_st_w |
-                 inst_beq  |
-                 inst_bne;
+assign rd_used = inst_store | inst_cond_branch;
 
 assign  EX_forward_valid_prefix     = EX_valid  &&  EX_rf_we   &&  EX_dest  != 5'b0;
 assign  EX_forward_src1             = EX_forward_valid_prefix  &&  EX_dest  == rj;

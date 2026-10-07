@@ -45,7 +45,7 @@ IF_stage u_IF_stage (
     );
 
 wire         EX_allowin;
-wire [157:0] ID_to_EX_bus;
+wire [160:0] ID_to_EX_bus;
 wire         ID_to_EX_valid;
 wire         WB_rf_we;
 wire [  4:0] WB_rf_waddr;
@@ -96,7 +96,7 @@ ID_stage u_ID_stage (
 
 wire         MEM_allowin;
 wire         EX_to_MEM_valid;
-wire [ 70:0] EX_to_MEM_bus;
+wire [ 75:0] EX_to_MEM_bus;
 wire         EX_data_sram_en;
 wire [  3:0] EX_data_sram_we;
 wire [ 31:0] EX_data_sram_addr;

@@ -2,13 +2,13 @@ module EX_stage (
     input  wire        clk,
     input  wire        reset,
 
-    input  wire [157:0] ID_to_EX_bus,
+    input  wire [160:0] ID_to_EX_bus,
     input  wire         ID_to_EX_valid,
     input  wire         MEM_allowin,
 
     output wire         EX_allowin,
     output wire         EX_to_MEM_valid,
-    output wire [ 70:0] EX_to_MEM_bus,
+    output wire [ 75:0] EX_to_MEM_bus,
     output wire         EX_data_sram_en,
     output wire [  3:0] EX_data_sram_we,
     output wire [ 31:0] EX_data_sram_addr,
@@ -24,7 +24,7 @@ module EX_stage (
     
 wire        EX_readygo;    
 reg         EX_valid;
-reg [157:0] EX_data;
+reg [160:0] EX_data;
 
 // 除法
 reg         div_done;
@@ -71,6 +71,10 @@ wire        EX_mem_en;
 wire        EX_is_div;      // 除法或取余指令
 wire        EX_div_signed;  // 有符号运算(求商或者取余)
 wire        EX_div_is_mod;  // 选择余数，否则选择商
+wire [ 1:0] EX_mem_size;
+wire        EX_load_unsigned;
+wire [31:0] EX_store_data;  // store 从ID接收的原始rd数据
+wire [ 3:0] EX_store_mask;
 
 wire [31:0] EX_pc;
 wire        EX_rf_we;
@@ -100,7 +104,10 @@ assign EX_to_MEM_bus    = {EX_pc,
                             EX_rf_we,
                             EX_dest,
                             EX_sel_rf_res,
-                            EX_wdata
+                            EX_wdata,
+                            EX_mem_size,
+                            EX_load_unsigned,
+                            EX_alu_res[1:0]     // 地址最低两位
                             };
 
 assign EX_wdata         = (EX_is_div)? div_result : EX_alu_res;
@@ -111,14 +118,22 @@ assign {EX_pc,
         EX_alu_src1,
         EX_alu_src2,
         EX_alu_op,
-        EX_data_sram_wdata,
+        EX_store_data,
         EX_mem_we,
         EX_mem_en,
         EX_is_div,
         EX_div_signed,
-        EX_div_is_mod}      = EX_data;
+        EX_div_is_mod,
+        EX_mem_size,
+        EX_load_unsigned}      = EX_data;
 
-assign EX_data_sram_we      = {4{EX_valid}} & EX_mem_we;
+assign EX_store_mask        = (EX_mem_size == 2'b01) ? (4'b0001 << EX_alu_res[1:0]) :
+                              (EX_mem_size == 2'b10) ? (EX_alu_res[1] ? 4'b1100 : 4'b0011) :
+                              4'b1111;
+assign EX_data_sram_we      = {4{EX_valid}} & EX_mem_we & EX_store_mask;
+assign EX_data_sram_wdata   = (EX_mem_size == 2'b01) ? {4{EX_store_data[7:0]}} :
+                              (EX_mem_size == 2'b10) ? {2{EX_store_data[15:0]}} :
+                              EX_store_data;
 assign EX_data_sram_en      = EX_valid && EX_mem_en;
 assign EX_data_sram_addr    = EX_alu_res;
 alu u_alu(
