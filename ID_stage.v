@@ -47,14 +47,20 @@ wire    rj_wait;
 wire    rk_wait;
 wire    rd_wait;
 */
-wire    data_hazard;
+wire        data_hazard;
+// 用于解决时序违例，而让涉及前递的跳转指令阻塞在ID级直到EX级指令流入MEM级
+wire        br_block;
+wire        br_need_rj;
+wire        br_need_rd;
+wire [31:0] rj_value_mem_wb;
+wire [31:0] rkd_value_mem_wb;
 
 // WB级前递的数据：
 wire [31:0] WB_wdata_forward;
 assign WB_wdata_forward = WB_rf_wdata;
 
 assign ID_allowin   = !ID_valid || ID_readygo && EX_allowin;
-assign ID_readygo   = !data_hazard;
+assign ID_readygo   = !data_hazard && !br_block;
 assign ID_to_EX_valid = ID_valid && ID_readygo;
 always @(posedge clk) begin
     if (reset) begin
@@ -187,6 +193,33 @@ wire [ 4:0] rf_raddr1;
 wire [31:0] rf_rdata1;
 wire [ 4:0] rf_raddr2;
 wire [31:0] rf_rdata2;
+
+wire        rj_eq_rd;
+
+// 检查数据冲突
+wire [ 4:0] WB_dest;
+wire        rj_used;
+wire        rk_used;
+wire        rd_used;
+
+// 存在前递的表征信号：
+wire    EX_forward_valid_prefix;
+wire    EX_forward_src1;     // EX级存在前递，说明EX级指令有效, 且EX级有寄存器写使能，且写的目的寄存器号不是0, 然后再比对是rj还是rkd
+wire    EX_forward_src2_rk;
+wire    EX_forward_src2_rd;
+wire    EX_forward_src2;
+
+wire    MEM_forward_valid_prefix;
+wire    MEM_forward_src1;
+wire    MEM_forward_src2_rk;
+wire    MEM_forward_src2_rd;
+wire    MEM_forward_src2;
+
+wire    WB_forward_valid_prefix;
+wire    WB_forward_src1;
+wire    WB_forward_src2_rk;
+wire    WB_forward_src2_rd;
+wire    WB_forward_src2;
 
 assign op_31_26  = inst[31:26];
 assign op_25_22  = inst[25:22];
@@ -325,8 +358,7 @@ regfile u_regfile(
     );
 
 
-wire rj_eq_rd;
-assign rj_eq_rd = (rj_value == rkd_value);
+assign rj_eq_rd = (rj_value_mem_wb == rkd_value_mem_wb);
 assign br_taken = (   inst_beq  &&  rj_eq_rd
                    || inst_bne  && !rj_eq_rd
                    || inst_jirl
@@ -334,11 +366,18 @@ assign br_taken = (   inst_beq  &&  rj_eq_rd
                    || inst_b
                   ) && ID_valid && ID_readygo && EX_allowin; // 注意只有在ID级指令能流向EX级时，br_taken才可能有效
 assign br_target = (inst_beq || inst_bne || inst_bl || inst_b) ? (ID_pc + br_offs) :
-                                                   /*inst_jirl*/ (rj_value + jirl_offs);
+                                                   /*inst_jirl*/ (rj_value_mem_wb + jirl_offs);
+// 复用原有MEM,WB前递通路，涉及前递的跳转指令的寄存器值只用MEM,WB级前递结果和寄存器堆的结果，不用EX级结果，避免时序违例
+assign rj_value_mem_wb  = (MEM_forward_src1) ? MEM_wdata_forward :
+                          (WB_forward_src1 ) ? WB_wdata_forward  :
+                           rf_rdata1;
+assign rkd_value_mem_wb = (MEM_forward_src2) ? MEM_wdata_forward :
+                          (WB_forward_src2 ) ? WB_wdata_forward  :
+                           rf_rdata2;
 
 assign ID_alu_src1 = (src1_is_pc) ? ID_pc[31:0] : 
                      (src1_is_0 ) ? 32'b0 : rj_value;
-assign ID_alu_src2 = (src2_is_imm) ? imm : rkd_value;
+assign ID_alu_src2 = (src2_is_imm)? imm   : rkd_value;
 
 assign ID_data_sram_we      = {4{mem_we && ID_valid}};
 assign ID_data_sram_en      = ID_valid && (inst_st_w || inst_ld_w); 
@@ -349,19 +388,24 @@ assign ID_is_div     = inst_div_w | inst_div_wu | inst_mod_w | inst_mod_wu;
 assign ID_div_signed = inst_div_w | inst_mod_w;
 assign ID_div_is_mod = inst_mod_w | inst_mod_wu;
 
-// 检查数据冲突
-wire [ 4:0] WB_dest;
-wire        rj_used;
-wire        rk_used;
-wire        rd_used;
-assign  WB_dest = WB_rf_waddr;
+assign  WB_dest    = WB_rf_waddr;
 
 // 目前只有load-use类会发生数据冲突(EX级有load指令，且发生了RAW)
 assign data_hazard = ID_valid && load_in_EX && (EX_dest != 5'b0) && (
-                    rk_used && (EX_dest == rk) ||
-                    rd_used && (EX_dest == rd) ||
-                    rj_used && (EX_dest == rj)
-                    );
+                     rk_used && (EX_dest == rk) ||
+                     rd_used && (EX_dest == rd) ||
+                     rj_used && (EX_dest == rj)
+                     );
+
+// 跳转指令中需要rj前递结果的（注意包含jirl）
+assign  br_need_rj = inst_beq || inst_bne || inst_jirl;
+// 跳转指令中需要rd前递结果的
+assign  br_need_rd = inst_beq || inst_bne;
+// 如果涉及前递的跳转指令需要当前EX级的前递结果，则让ID级跳转指令阻塞
+assign  br_block   = ID_valid && EX_valid && EX_rf_we && (EX_dest != 5'b0) &&
+                     ( (br_need_rj && (EX_dest == rj)) ||
+                       (br_need_rd && (EX_dest == rd)) 
+                     ); 
 
 assign rj_used = inst_add_w  |
                  inst_sub_w  |
@@ -418,25 +462,6 @@ assign rk_used = inst_add_w  |
 assign rd_used = inst_st_w |
                  inst_beq  |
                  inst_bne;
-
-// 存在前递的表征信号：
-wire    EX_forward_valid_prefix;
-wire    EX_forward_src1;     // EX级存在前递，说明EX级指令有效, 且EX级有寄存器写使能，且写的目的寄存器号不是0, 然后再比对是rj还是rkd
-wire    EX_forward_src2_rk;
-wire    EX_forward_src2_rd;
-wire    EX_forward_src2;
-
-wire    MEM_forward_valid_prefix;
-wire    MEM_forward_src1;
-wire    MEM_forward_src2_rk;
-wire    MEM_forward_src2_rd;
-wire    MEM_forward_src2;
-
-wire    WB_forward_valid_prefix;
-wire    WB_forward_src1;
-wire    WB_forward_src2_rk;
-wire    WB_forward_src2_rd;
-wire    WB_forward_src2;
 
 assign  EX_forward_valid_prefix     = EX_valid  &&  EX_rf_we   &&  EX_dest  != 5'b0;
 assign  EX_forward_src1             = EX_forward_valid_prefix  &&  EX_dest  == rj;
