@@ -20,7 +20,7 @@ module MEM_stage (
     output wire        ms_rf_we,
     output wire [31:0] MEM_wdata_forward,
     output wire        csr_in_MEM, // 已结合MEM_valid的CSR标记，通知ID继续等待WB返回值
-    output wire        ertn_in_MEM // 已结合MEM_valid的ertn标记，阻止年轻指令进入EX
+    output wire        ertn_in_MEM // 已结合MEM_valid的ertn标记，通知EX禁止年轻指令发出请求
 );
 
 wire       MEM_readygo;

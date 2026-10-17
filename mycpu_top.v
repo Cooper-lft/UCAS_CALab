@@ -33,11 +33,10 @@ wire [`CSR_NUM_WD-1:0] csr_num; // WB -> CSR：读写共用的编号
 wire [31:0] csr_rvalue;  // CSR -> WB：更新前的旧值，写回rd并供WB前递使用
 wire [31:0] csr_wmask;   // WB -> CSR：逐位写掩码
 wire [31:0] csr_wvalue;  // WB -> CSR：来自原GR[rd]的写入数据
-// EX/MEM反馈给ID的指令类型标记，均已结合所在级的valid。
+// EX/MEM反馈给ID的CSR指令类型标记，均已结合所在级的valid。
 wire        csr_in_EX;  // CSR返回值尚未就绪，相关的ID指令需等待
-wire        ertn_in_EX; // ertn尚未提交，ID暂停发射年轻指令
 wire        csr_in_MEM; // CSR仍需等到WB才能提供返回值
-wire        ertn_in_MEM;// ertn仍未提交，继续阻止年轻指令进入EX
+wire        ertn_in_MEM;// MEM -> EX：禁止年轻指令发出访存或除法请求，等待WB统一冲刷
 
 csr u_csr (
     .clk        (clk        ),
@@ -122,14 +121,12 @@ ID_stage u_ID_stage (
     .EX_rf_we           (EX_rf_we         ),
     .load_in_EX         (load_in_EX       ),
     .csr_in_EX          (csr_in_EX        ),
-    .ertn_in_EX         (ertn_in_EX       ),
     .EX_wdata_forward   (EX_wdata_forward ),
     
     .MEM_valid          (MEM_valid        ),
     .MEM_dest           (MEM_dest         ),
     .MEM_rf_we          (MEM_rf_we        ),
     .csr_in_MEM         (csr_in_MEM       ),
-    .ertn_in_MEM        (ertn_in_MEM      ),
     .MEM_wdata_forward  (MEM_wdata_forward),
     
     .WB_valid           (WB_valid         ),
@@ -148,6 +145,11 @@ EX_stage u_EX_stage (
     .clk                (clk                ),
     .reset              (reset              ),
     .ertn_flush         (ertn_flush         ),
+    .ertn_in_MEM        (ertn_in_MEM        ),
+    // step3再接入EX自身异常和MEM/WB有效异常；当前只启用ertn请求保护。
+    .ex_exception       (1'b0               ),
+    .mem_exception      (1'b0               ),
+    .wb_exception       (1'b0               ),
     .ID_to_EX_bus       (ID_to_EX_bus       ),
     .ID_to_EX_valid     (ID_to_EX_valid     ),
     .MEM_allowin        (MEM_allowin        ),
@@ -163,8 +165,7 @@ EX_stage u_EX_stage (
     .es_rf_we           (EX_rf_we           ),
     .load_in_EX         (load_in_EX         ),
     .EX_wdata_forward   (EX_wdata_forward   ),
-    .csr_in_EX          (csr_in_EX          ),
-    .ertn_in_EX         (ertn_in_EX         )
+    .csr_in_EX          (csr_in_EX          )
     );
 assign data_sram_en         = EX_data_sram_en;
 assign data_sram_we         = EX_data_sram_we;

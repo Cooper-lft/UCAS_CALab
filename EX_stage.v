@@ -4,6 +4,11 @@ module EX_stage (
     input  wire        clk,
     input  wire        reset,
     input  wire        ertn_flush,  // 来自WB：清除本级valid及除法控制状态，并禁止访存
+    input  wire        ertn_in_MEM, // MEM中有有效ertn，禁止EX年轻指令发出访存或除法请求
+    // step3扩展接口：目前顶层均接0，尚未接入异常检测和异常信息传递。
+    input  wire        ex_exception,  // EX当前指令自身有异常，禁止其发出请求
+    input  wire        mem_exception, // MEM中有有效异常指令，未来由MEM_valid与异常标记共同产生
+    input  wire        wb_exception,  // WB中有有效异常指令，未来由WB_valid与异常标记共同产生
 
     input  wire [`ID_TO_EX_BUS_WD-1:0] ID_to_EX_bus,
     input  wire         ID_to_EX_valid,
@@ -23,8 +28,7 @@ module EX_stage (
     output wire         es_rf_we,
     output wire         load_in_EX,        // EX中有有效load，用于ID的load-use停顿判断
     output wire [ 31:0] EX_wdata_forward,   // 由EX级前递的数据
-    output wire         csr_in_EX,   // 已结合EX_valid的CSR指令标记，通知ID返回值尚未就绪
-    output wire         ertn_in_EX   // 已结合EX_valid的ertn标记，通知ID暂停年轻指令
+    output wire         csr_in_EX    // 已结合EX_valid的CSR指令标记，通知ID返回值尚未就绪
 );
     
 wire        EX_readygo;    
@@ -95,6 +99,13 @@ wire [31:0] EX_csr_wmask;    // ID已取得的写掩码
 wire [31:0] EX_csr_wvalue;   // ID已取得的写入值，后续不再重新读取GR[rd]
 wire        EX_is_ertn;      // ertn标记随指令流向WB
 
+wire        EX_request_allowed; // 本拍允许访存或启动除法；地址和数据无需因取消而清零
+// MEM中的ertn提前阻止年轻指令发出请求；WB仍通过ertn_flush统一清除valid。
+// 异常输入仅预留请求保护条件；step3还需接入异常传递、报告及冲刷逻辑。
+assign EX_request_allowed = EX_valid && !reset &&
+                            !ex_exception && !mem_exception && !wb_exception &&
+                            !ertn_in_MEM && !ertn_flush;
+
 // EX_readygo置1，要不然是非除法指令，要不然是除法指令且结果已经拿到下，下一拍就能送入MEM级(div_result_valid)或者EX级中有除法器结果的缓存（div_done）
 assign EX_readygo       = !EX_is_div || div_done || div_result_valid;
 assign EX_to_MEM_valid  = EX_valid && EX_readygo && !ertn_flush;
@@ -154,11 +165,11 @@ assign {EX_pc,
 assign EX_store_mask        = (EX_mem_size == 2'b01) ? (4'b0001 << EX_alu_res[1:0]) :
                               (EX_mem_size == 2'b10) ? (EX_alu_res[1] ? 4'b1100 : 4'b0011) :
                               4'b1111;
-assign EX_data_sram_we      = {4{EX_valid && !reset && !ertn_flush}} & EX_mem_we & EX_store_mask;
+assign EX_data_sram_we      = {4{EX_request_allowed}} & EX_mem_we & EX_store_mask;
 assign EX_data_sram_wdata   = (EX_mem_size == 2'b01) ? {4{EX_store_data[7:0]}} :
                               (EX_mem_size == 2'b10) ? {2{EX_store_data[15:0]}} :
                               EX_store_data;
-assign EX_data_sram_en      = EX_valid && EX_mem_en && !reset && !ertn_flush;
+assign EX_data_sram_en      = EX_request_allowed && EX_mem_en;
 assign EX_data_sram_addr    = EX_alu_res;
 alu u_alu(
     .alu_op     (EX_alu_op  ),
@@ -172,13 +183,15 @@ assign  es_rf_we    = EX_rf_we;
 assign  es_dest     = EX_dest;
 
 // 向ID报告结果尚未就绪的指令：load要等MEM，CSR要等WB。
-assign  load_in_EX          = EX_data_sram_en && !EX_data_sram_we;
+// 根据指令属性判断load，避免将是否允许发出访存请求混入类型判断。
+assign  load_in_EX          = EX_valid && EX_sel_rf_res;
 assign  EX_wdata_forward    = EX_wdata;
 assign  csr_in_EX           = EX_valid && EX_csr_re;
-assign  ertn_in_EX          = EX_valid && EX_is_ertn;
 
 // 除法器：
-assign div_req                  = EX_valid && !reset && !ertn_flush && EX_is_div && !div_done && !div_sent;
+// 被较老ertn取消的除法不能进入除法器，避免冲刷后仍返回旧结果。
+// 未发出的年轻除法等待WB冲刷；step3需另外处理自身带异常指令的放行条件。
+assign div_req                  = EX_request_allowed && EX_is_div && !div_done && !div_sent;
 assign dividend_tvalid_signed   = div_req   && EX_div_signed;
 assign divisor_tvalid_signed    = dividend_tvalid_signed;
 assign dividend_tvalid_unsigned = div_req   && !EX_div_signed;

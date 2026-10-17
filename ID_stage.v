@@ -27,14 +27,12 @@ module ID_stage (
     input  wire        EX_rf_we,
     input  wire        load_in_EX,
     input  wire        csr_in_EX,   // EX中有有效CSR指令，其通用寄存器结果尚未就绪
-    input  wire        ertn_in_EX,  // EX中有有效ertn，后续指令暂留ID
     input  wire [31:0] EX_wdata_forward,
 
     input  wire        MEM_valid,
     input  wire [ 4:0] MEM_dest,
     input  wire        MEM_rf_we,
     input  wire        csr_in_MEM,  // MEM中有有效CSR指令，仍需等到WB取得返回值
-    input  wire        ertn_in_MEM, // MEM中有有效ertn，继续阻止年轻指令进入EX
     input  wire [31:0] MEM_wdata_forward,
 
     input  wire        WB_valid,
@@ -56,7 +54,6 @@ wire    rd_wait;
 */
 wire        data_hazard;
 wire        csr_hazard;   // ID需要EX/MEM中CSR指令将写回的通用寄存器值，必须等待WB
-wire        ertn_pending; // 较老的ertn尚在EX/MEM，使ID暂停发射，防止年轻指令产生副作用
 // 用于解决时序违例，而让涉及前递的跳转指令阻塞在ID级直到EX级指令流入MEM级
 wire        br_block;
 wire        br_need_rj;
@@ -69,7 +66,8 @@ wire [31:0] WB_wdata_forward;
 assign WB_wdata_forward = WB_rf_wdata;
 
 assign ID_allowin       = !ID_valid || ID_readygo && EX_allowin;
-assign ID_readygo       = !data_hazard && !br_block && !csr_hazard && !ertn_pending && !ertn_flush;
+// ertn后的指令可以继续流动；EX负责禁止其请求，WB返回生效当拍停止ID发射。
+assign ID_readygo       = !data_hazard && !br_block && !csr_hazard && !ertn_flush;
 assign ID_to_EX_valid   = ID_valid && ID_readygo;
 always @(posedge clk) begin
     if (reset) begin
@@ -499,10 +497,6 @@ assign csr_hazard = ID_valid && (
                       (rk_used && MEM_dest == rk) ||
                       (rd_used && MEM_dest == rd)))
                     );
-
-// ertn在EX/MEM时，将年轻指令留在ID；到WB时由ertn_flush取消它们。
-// 特别是store在EX就会写内存，不能等到WB清空时才试图撤销已经发生的写入。
-assign ertn_pending = ertn_in_EX || ertn_in_MEM;
 
 // 跳转指令中需要rj前递结果的（注意包含jirl）
 assign  br_need_rj = inst_cond_branch || inst_jirl;
