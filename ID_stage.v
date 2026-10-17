@@ -1,12 +1,15 @@
+`include "mycpu.h"
+
 module ID_stage (
     input  wire        clk,
     input  wire        reset,
+    input  wire        ertn_flush,  // 来自WB：ertn本拍生效，取消ID中的年轻指令
     
     input  wire        IF_to_ID_valid,
-    input  wire [63:0] IF_to_ID_bus,
+    input  wire [`IF_TO_ID_BUS_WD-1:0] IF_to_ID_bus,
     
     input  wire        EX_allowin,
-    output wire [160:0] ID_to_EX_bus,
+    output wire [`ID_TO_EX_BUS_WD-1:0] ID_to_EX_bus,
     output wire        ID_to_EX_valid,
     
     output wire        ID_allowin,
@@ -23,11 +26,15 @@ module ID_stage (
     input  wire [ 4:0] EX_dest,
     input  wire        EX_rf_we,
     input  wire        load_in_EX,
+    input  wire        csr_in_EX,   // EX中有有效CSR指令，其通用寄存器结果尚未就绪
+    input  wire        ertn_in_EX,  // EX中有有效ertn，后续指令暂留ID
     input  wire [31:0] EX_wdata_forward,
 
     input  wire        MEM_valid,
     input  wire [ 4:0] MEM_dest,
     input  wire        MEM_rf_we,
+    input  wire        csr_in_MEM,  // MEM中有有效CSR指令，仍需等到WB取得返回值
+    input  wire        ertn_in_MEM, // MEM中有有效ertn，继续阻止年轻指令进入EX
     input  wire [31:0] MEM_wdata_forward,
 
     input  wire        WB_valid,
@@ -38,7 +45,7 @@ module ID_stage (
 );
 
 wire        ID_readygo;
-reg [63:0]  ID_data; // from IF
+reg [`IF_TO_ID_BUS_WD-1:0] ID_data; // from IF
 reg         ID_valid;
 
 // 检测数据冲突
@@ -48,6 +55,8 @@ wire    rk_wait;
 wire    rd_wait;
 */
 wire        data_hazard;
+wire        csr_hazard;   // ID需要EX/MEM中CSR指令将写回的通用寄存器值，必须等待WB
+wire        ertn_pending; // 较老的ertn尚在EX/MEM，使ID暂停发射，防止年轻指令产生副作用
 // 用于解决时序违例，而让涉及前递的跳转指令阻塞在ID级直到EX级指令流入MEM级
 wire        br_block;
 wire        br_need_rj;
@@ -59,14 +68,14 @@ wire [31:0] rkd_value_mem_wb;
 wire [31:0] WB_wdata_forward;
 assign WB_wdata_forward = WB_rf_wdata;
 
-assign ID_allowin   = !ID_valid || ID_readygo && EX_allowin;
-assign ID_readygo   = !data_hazard && !br_block;
-assign ID_to_EX_valid = ID_valid && ID_readygo;
+assign ID_allowin       = !ID_valid || ID_readygo && EX_allowin;
+assign ID_readygo       = !data_hazard && !br_block && !csr_hazard && !ertn_pending && !ertn_flush;
+assign ID_to_EX_valid   = ID_valid && ID_readygo;
 always @(posedge clk) begin
     if (reset) begin
         ID_valid <= 1'b0;
     end
-    else if (br_taken_cancel) begin  // 控制冒险
+    else if (ertn_flush || br_taken_cancel) begin  // 控制冒险
         ID_valid <= 1'b0;
     end
     else if (ID_allowin) begin
@@ -89,7 +98,7 @@ wire [ 4:0] ID_dest;
 wire        ID_sel_rf_res;
 wire [31:0] ID_alu_src1;
 wire [31:0] ID_alu_src2;
-wire [14:0] ID_alu_op;  
+wire [`ALU_OP_WD-1:0] ID_alu_op;
 wire [31:0] ID_data_sram_wdata;  
 wire [ 3:0] ID_data_sram_we;
 wire        ID_data_sram_en;
@@ -98,6 +107,14 @@ wire        ID_div_signed;  // 有符号运算(求商或者取余)
 wire        ID_div_is_mod;  // 选择余数，否则选择商
 wire [ 1:0] ID_mem_size;    // 00为字，01为字节，10为半字
 wire        ID_load_u;      // 进行零扩展
+
+// 以下是随指令传递的操作标记/数据，真正的CSR访问使能到WB再用valid限定。
+wire        ID_csr_re;       // 三条CSR指令均读旧值，并将旧值写回rd
+wire        ID_csr_we;       // csrwr、csrxchg需要更新CSR
+wire [`CSR_NUM_WD-1:0] ID_csr_num; // 从inst[23:10]提取的CSR编号
+wire [31:0] ID_csr_wmask;    // csrwr为全1；csrxchg取经过前递选择的GR[rj]
+wire [31:0] ID_csr_wvalue;   // 经过前递选择的GR[rd]，作为CSR写入数据
+wire        ID_is_ertn;      // 当前指令为ertn，到WB时据此产生ertn_flush
 
 assign ID_to_EX_bus = {ID_pc,
                        ID_rf_we,
@@ -113,7 +130,13 @@ assign ID_to_EX_bus = {ID_pc,
                        ID_div_signed,
                        ID_div_is_mod,
                        ID_mem_size,
-                       ID_load_u};
+                       ID_load_u,
+                       ID_csr_re,
+                       ID_csr_we,
+                       ID_csr_num,
+                       ID_csr_wmask,
+                       ID_csr_wvalue,
+                       ID_is_ertn};
 
 
 // decode
@@ -194,6 +217,11 @@ wire        inst_ld_b;
 wire        inst_ld_h;
 wire        inst_ld_bu;
 wire        inst_ld_hu;
+wire        inst_csrrd;
+wire        inst_csrwr;
+wire        inst_csrxchg;
+wire        inst_ertn;
+wire        inst_csr;
 
 wire        inst_cond_branch;
 wire        inst_store;
@@ -309,6 +337,22 @@ assign inst_ld_h   = op_31_26_d[6'h0a] & op_25_22_d[4'h1];
 assign inst_ld_bu  = op_31_26_d[6'h0a] & op_25_22_d[4'h8];
 assign inst_ld_hu  = op_31_26_d[6'h0a] & op_25_22_d[4'h9];
 
+// exp12：rj字段为0/1时用于区分csrrd/csrwr，不表示需要读GR[0]/GR[1]；
+// 其余编号表示csrxchg，此时GR[rj]才是写掩码。ertn直接匹配完整指令码。
+assign inst_csrrd   = (inst[31:24] == `CSR_OPCODE) && (rj == 5'd0);
+assign inst_csrwr   = (inst[31:24] == `CSR_OPCODE) && (rj == 5'd1);
+assign inst_csrxchg = (inst[31:24] == `CSR_OPCODE) && (rj != 5'd0) && (rj != 5'd1);
+assign inst_ertn    = (inst == `INST_ERTN);
+assign inst_csr     = inst_csrrd | inst_csrwr | inst_csrxchg;
+
+assign ID_csr_re     = inst_csr;
+assign ID_csr_we     = inst_csrwr | inst_csrxchg;
+assign ID_csr_num    = inst[23:10];
+assign ID_csr_wmask  = inst_csrwr   ? 32'hffffffff :
+                       inst_csrxchg ? rj_value : 32'b0;
+assign ID_csr_wvalue = ID_csr_we ? rkd_value : 32'b0;
+assign ID_is_ertn    = inst_ertn;
+
 assign inst_cond_branch = inst_beq  | inst_bne  | inst_blt  | inst_bge   | inst_bltu  | inst_bgeu;
 assign inst_store       = inst_st_w | inst_st_b | inst_st_h;
 assign inst_load        = inst_ld_w | inst_ld_b | inst_ld_h | inst_ld_bu | inst_ld_hu;
@@ -350,7 +394,7 @@ assign br_offs = need_si26 ? {{ 4{i26[25]}}, i26[25:0], 2'b0} :
 
 assign jirl_offs = {{14{i16[15]}}, i16[15:0], 2'b0};
 
-assign src_reg_is_rd = inst_cond_branch | inst_store;
+assign src_reg_is_rd = inst_cond_branch | inst_store | inst_csrwr | inst_csrxchg;
 
 assign src1_is_pc    = inst_jirl | inst_bl | inst_pcaddu12i;
 assign src1_is_0     = inst_lu12i_w;    // lu12i指令的alu的操作数1应该是0而不是pc或者是寄存器的值，操作数2是立即数
@@ -375,7 +419,7 @@ assign ID_sel_rf_res    = inst_load;
 assign dst_is_r1        = inst_bl;
 
 // 涉及寄存器堆写操作
-assign gr_we            = ~inst_store & ~inst_cond_branch & ~inst_b;
+assign gr_we            = ~inst_store & ~inst_cond_branch & ~inst_b & ~inst_ertn;
 assign mem_we           = inst_store;
 assign ID_dest          = dst_is_r1 ? 5'd1 : rd;
 assign ID_rf_we         = gr_we && ID_valid;
@@ -436,12 +480,29 @@ assign ID_div_is_mod = inst_mod_w | inst_mod_wu;
 
 assign  WB_dest    = WB_rf_waddr;
 
-// 目前只有load-use类会发生数据冲突(EX级有load指令，且发生了RAW)
+// load在EX时尚无结果；CSR指令的结果则要等到WB，下面分别判断这两类相关。
 assign data_hazard = ID_valid && load_in_EX && (EX_dest != 5'b0) && (
                      rk_used && (EX_dest == rk) ||
                      rd_used && (EX_dest == rd) ||
                      rj_used && (EX_dest == rj)
                      );
+
+// 检查的是CSR指令返回值引起的通用寄存器RAW，而不是两条指令访问同一CSR。
+// 只有ID实际使用的源寄存器与目的寄存器匹配才停顿；目的寄存器为r0时无需等待。
+assign csr_hazard = ID_valid && (
+                    (EX_valid && EX_rf_we && csr_in_EX && (EX_dest != 5'b0) &&
+                     ((rj_used && EX_dest == rj) ||
+                      (rk_used && EX_dest == rk) ||
+                      (rd_used && EX_dest == rd))) ||
+                    (MEM_valid && MEM_rf_we && csr_in_MEM && (MEM_dest != 5'b0) &&
+                     ((rj_used && MEM_dest == rj) ||
+                      (rk_used && MEM_dest == rk) ||
+                      (rd_used && MEM_dest == rd)))
+                    );
+
+// ertn在EX/MEM时，将年轻指令留在ID；到WB时由ertn_flush取消它们。
+// 特别是store在EX就会写内存，不能等到WB清空时才试图撤销已经发生的写入。
+assign ertn_pending = ertn_in_EX || ertn_in_MEM;
 
 // 跳转指令中需要rj前递结果的（注意包含jirl）
 assign  br_need_rj = inst_cond_branch || inst_jirl;
@@ -483,7 +544,8 @@ assign rj_used = inst_add_w         |
                  inst_mod_wu        |
                  inst_mul           |
                  inst_mulh          |
-                 inst_mulhu;
+                 inst_mulhu         |
+                 inst_csrxchg;
 
 assign rk_used = inst_add_w  |
                  inst_sub_w  |
@@ -504,22 +566,23 @@ assign rk_used = inst_add_w  |
                  inst_mulh   |
                  inst_mulhu;                
 
-assign rd_used = inst_store | inst_cond_branch;
+assign rd_used = inst_store | inst_cond_branch | inst_csrwr | inst_csrxchg;
 
-assign  EX_forward_valid_prefix     = EX_valid  &&  EX_rf_we   &&  EX_dest  != 5'b0;
-assign  EX_forward_src1             = EX_forward_valid_prefix  &&  EX_dest  == rj;
+// CSR的真实返回值到WB才可用，禁止将其EX/MEM阶段的ALU输出当作有效前递值。
+assign  EX_forward_valid_prefix     = EX_valid && EX_rf_we && !csr_in_EX && EX_dest != 5'b0;
+assign  EX_forward_src1             = EX_forward_valid_prefix && rj_used && EX_dest == rj;
 assign  EX_forward_src2_rk          = EX_forward_valid_prefix  &&  EX_dest  == rk; 
 assign  EX_forward_src2_rd          = EX_forward_valid_prefix  &&  EX_dest  == rd;
 assign  EX_forward_src2             = (rk_used && EX_forward_src2_rk) || (rd_used && EX_forward_src2_rd);
 
-assign  MEM_forward_valid_prefix    = MEM_valid &&  MEM_rf_we   &&  MEM_dest != 5'b0;
-assign  MEM_forward_src1            = MEM_forward_valid_prefix  &&  MEM_dest == rj;
+assign  MEM_forward_valid_prefix    = MEM_valid && MEM_rf_we && !csr_in_MEM && MEM_dest != 5'b0;
+assign  MEM_forward_src1            = MEM_forward_valid_prefix && rj_used && MEM_dest == rj;
 assign  MEM_forward_src2_rk         = MEM_forward_valid_prefix  &&  MEM_dest == rk;
 assign  MEM_forward_src2_rd         = MEM_forward_valid_prefix  &&  MEM_dest == rd;
 assign  MEM_forward_src2            = (rk_used && MEM_forward_src2_rk) || (rd_used && MEM_forward_src2_rd);
 
 assign  WB_forward_valid_prefix     = WB_valid  &&  WB_rf_we   &&  WB_dest  != 5'b0;
-assign  WB_forward_src1             = WB_forward_valid_prefix  &&  WB_dest  == rj;
+assign  WB_forward_src1             = WB_forward_valid_prefix && rj_used && WB_dest == rj;
 assign  WB_forward_src2_rk          = WB_forward_valid_prefix  &&  WB_dest  == rk;
 assign  WB_forward_src2_rd          = WB_forward_valid_prefix  &&  WB_dest  == rd;
 assign  WB_forward_src2             = (rk_used && WB_forward_src2_rk) || (rd_used && WB_forward_src2_rd);

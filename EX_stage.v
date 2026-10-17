@@ -1,14 +1,17 @@
+`include "mycpu.h"
+
 module EX_stage (
     input  wire        clk,
     input  wire        reset,
+    input  wire        ertn_flush,  // 来自WB：清除本级valid及除法控制状态，并禁止访存
 
-    input  wire [160:0] ID_to_EX_bus,
+    input  wire [`ID_TO_EX_BUS_WD-1:0] ID_to_EX_bus,
     input  wire         ID_to_EX_valid,
     input  wire         MEM_allowin,
 
     output wire         EX_allowin,
     output wire         EX_to_MEM_valid,
-    output wire [ 75:0] EX_to_MEM_bus,
+    output wire [`EX_TO_MEM_BUS_WD-1:0] EX_to_MEM_bus,
     output wire         EX_data_sram_en,
     output wire [  3:0] EX_data_sram_we,
     output wire [ 31:0] EX_data_sram_addr,
@@ -18,13 +21,15 @@ module EX_stage (
     output wire         es_valid,
     output wire [  4:0] es_dest,
     output wire         es_rf_we,
-    output wire         load_in_EX,         // 目前在前递实现下，只有load-use类当load在EX级且use指令在ID级时，要停顿，该信号用于检测load指令是否在EX级
-    output wire [ 31:0] EX_wdata_forward    // 由EX级前递的数据
+    output wire         load_in_EX,        // EX中有有效load，用于ID的load-use停顿判断
+    output wire [ 31:0] EX_wdata_forward,   // 由EX级前递的数据
+    output wire         csr_in_EX,   // 已结合EX_valid的CSR指令标记，通知ID返回值尚未就绪
+    output wire         ertn_in_EX   // 已结合EX_valid的ertn标记，通知ID暂停年轻指令
 );
     
 wire        EX_readygo;    
 reg         EX_valid;
-reg [160:0] EX_data;
+reg [`ID_TO_EX_BUS_WD-1:0] EX_data;
 
 // 除法
 reg         div_done;
@@ -65,7 +70,7 @@ wire [31:0] div_result; // 除法最终的结果，跟alu的结果（包含可�
 
 wire [31:0] EX_alu_src1;
 wire [31:0] EX_alu_src2;
-wire [14:0] EX_alu_op;
+wire [`ALU_OP_WD-1:0] EX_alu_op;
 wire [ 3:0] EX_mem_we;
 wire        EX_mem_en;
 wire        EX_is_div;      // 除法或取余指令
@@ -82,13 +87,20 @@ wire [ 4:0] EX_dest;
 wire        EX_sel_rf_res;
 wire [31:0] EX_alu_res;
 wire [31:0] EX_wdata;
+// 从ID锁存并传至MEM的CSR信息；EX本级不读写CSR。
+wire        EX_csr_re;       // 该指令需在WB读CSR并返回旧值
+wire        EX_csr_we;       // 该指令需在WB更新CSR
+wire [`CSR_NUM_WD-1:0] EX_csr_num; // CSR编号
+wire [31:0] EX_csr_wmask;    // ID已取得的写掩码
+wire [31:0] EX_csr_wvalue;   // ID已取得的写入值，后续不再重新读取GR[rd]
+wire        EX_is_ertn;      // ertn标记随指令流向WB
 
 // EX_readygo置1，要不然是非除法指令，要不然是除法指令且结果已经拿到下，下一拍就能送入MEM级(div_result_valid)或者EX级中有除法器结果的缓存（div_done）
 assign EX_readygo       = !EX_is_div || div_done || div_result_valid;
-assign EX_to_MEM_valid  = EX_valid && EX_readygo;
+assign EX_to_MEM_valid  = EX_valid && EX_readygo && !ertn_flush;
 assign EX_allowin       = !EX_valid || EX_to_MEM_valid && MEM_allowin;
 always @(posedge clk) begin
-    if (reset) begin
+    if (reset || ertn_flush) begin
         EX_valid <= 1'b0;
     end
     else if (EX_allowin) begin
@@ -107,7 +119,13 @@ assign EX_to_MEM_bus    = {EX_pc,
                             EX_wdata,
                             EX_mem_size,
                             EX_load_unsigned,
-                            EX_alu_res[1:0]     // 地址最低两位
+                            EX_alu_res[1:0],    // 地址最低两位
+                            EX_csr_re,
+                            EX_csr_we,
+                            EX_csr_num,
+                            EX_csr_wmask,
+                            EX_csr_wvalue,
+                            EX_is_ertn
                             };
 
 assign EX_wdata         = (EX_is_div)? div_result : EX_alu_res;
@@ -125,16 +143,22 @@ assign {EX_pc,
         EX_div_signed,
         EX_div_is_mod,
         EX_mem_size,
-        EX_load_unsigned}      = EX_data;
+        EX_load_unsigned,
+        EX_csr_re,
+        EX_csr_we,
+        EX_csr_num,
+        EX_csr_wmask,
+        EX_csr_wvalue,
+        EX_is_ertn}            = EX_data;
 
 assign EX_store_mask        = (EX_mem_size == 2'b01) ? (4'b0001 << EX_alu_res[1:0]) :
                               (EX_mem_size == 2'b10) ? (EX_alu_res[1] ? 4'b1100 : 4'b0011) :
                               4'b1111;
-assign EX_data_sram_we      = {4{EX_valid}} & EX_mem_we & EX_store_mask;
+assign EX_data_sram_we      = {4{EX_valid && !reset && !ertn_flush}} & EX_mem_we & EX_store_mask;
 assign EX_data_sram_wdata   = (EX_mem_size == 2'b01) ? {4{EX_store_data[7:0]}} :
                               (EX_mem_size == 2'b10) ? {2{EX_store_data[15:0]}} :
                               EX_store_data;
-assign EX_data_sram_en      = EX_valid && EX_mem_en;
+assign EX_data_sram_en      = EX_valid && EX_mem_en && !reset && !ertn_flush;
 assign EX_data_sram_addr    = EX_alu_res;
 alu u_alu(
     .alu_op     (EX_alu_op  ),
@@ -147,14 +171,14 @@ assign  es_valid    = EX_valid;
 assign  es_rf_we    = EX_rf_we;
 assign  es_dest     = EX_dest;
 
-// 前递判断中，目前只有load-use类存在RAW数据冲突，即如果load指令在EX级且有指令在ID级要读load指令写的寄存器，
-// 那么需要让ID级指令停下直到EX级的load指令进入MEM级。
-// 所以新增一个load_in_EX 信号
+// 向ID报告结果尚未就绪的指令：load要等MEM，CSR要等WB。
 assign  load_in_EX          = EX_data_sram_en && !EX_data_sram_we;
 assign  EX_wdata_forward    = EX_wdata;
+assign  csr_in_EX           = EX_valid && EX_csr_re;
+assign  ertn_in_EX          = EX_valid && EX_is_ertn;
 
 // 除法器：
-assign div_req                  = EX_valid  && !reset && EX_is_div && !div_done && !div_sent;
+assign div_req                  = EX_valid && !reset && !ertn_flush && EX_is_div && !div_done && !div_sent;
 assign dividend_tvalid_signed   = div_req   && EX_div_signed;
 assign divisor_tvalid_signed    = dividend_tvalid_signed;
 assign dividend_tvalid_unsigned = div_req   && !EX_div_signed;
@@ -166,7 +190,7 @@ assign div_input_handshake      = div_req   &&
 
 
 always @(posedge clk) begin
-    if (reset || EX_allowin)
+    if (reset || ertn_flush || EX_allowin)
         div_sent <= 1'b0;
     else if (div_input_handshake)
         div_sent <= 1'b1;
@@ -180,11 +204,11 @@ assign      div_out_data        = (EX_div_signed) ? dout_tdata_signed : dout_tda
 assign      quotient            = div_out_data[63:32];
 assign      remainder           = div_out_data[31:0];
 
-assign      div_result_valid    = EX_valid && !reset && EX_is_div && div_sent && div_out_valid;
+assign      div_result_valid    = EX_valid && !reset && !ertn_flush && EX_is_div && div_sent && div_out_valid;
 assign      div_result_now      = (EX_div_is_mod) ? remainder : quotient;
 assign      div_result          = (div_done) ? div_result_r : div_result_now; // 如果div_done为1，说明除法器得到结果且并没有在得到结果的下一拍将结果送入MEM级
 always @(posedge clk) begin
-    if(reset || EX_allowin) begin
+    if(reset || ertn_flush || EX_allowin) begin
         div_done        <= 1'b0;
     end
     else if(div_result_valid && !div_done) begin

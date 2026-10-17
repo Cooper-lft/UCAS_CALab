@@ -1,5 +1,7 @@
+`include "mycpu.h"
+
 module alu(
-  input  wire [14:0] alu_op,
+  input  wire [`ALU_OP_WD-1:0] alu_op,
   input  wire [31:0] alu_src1,
   input  wire [31:0] alu_src2,
   output wire [31:0] alu_result
