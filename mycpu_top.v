@@ -48,6 +48,12 @@ csr u_csr (
     .csr_we     (csr_we     ),
     .csr_wmask  (csr_wmask  ),
     .csr_wvalue (csr_wvalue ),
+    // syscall异常流水线尚未接入；后续改接WB的异常信息，并将ex_entry送入IF。
+    .wb_ex      (1'b0       ),
+    .wb_pc      (32'b0      ),
+    .wb_ecode   (6'b0       ),
+    .wb_esubcode(9'b0       ),
+    .ex_entry   (           ),
     .ertn_flush (ertn_flush ),
     .ertn_entry (ertn_entry )
     );

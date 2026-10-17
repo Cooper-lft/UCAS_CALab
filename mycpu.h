@@ -18,4 +18,15 @@
 `define CSR_OPCODE          8'h04        // 三条CSR指令共有的inst[31:24]编码
 `define INST_ERTN           32'h06483800  // ertn无操作数，直接匹配完整指令码
 
+
+`define CSR_CRMD    14'h0000
+`define CSR_PRMD    14'h0001
+`define CSR_ESTAT   14'h0005
+`define CSR_ERA     14'h0006
+`define CSR_EENTRY  14'h000c
+`define CSR_SAVE0   14'h0030
+`define CSR_SAVE1   14'h0031
+`define CSR_SAVE2   14'h0032
+`define CSR_SAVE3   14'h0033
+
 `endif
