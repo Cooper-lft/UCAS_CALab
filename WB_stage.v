@@ -16,6 +16,7 @@ module WB_stage (
     output wire        ws_valid,
 
     // 对CSR模块的实际访问接口：使能信号已结合WB_valid和reset。
+    // 编号、掩码和数据无需在无效拍清零，CSR模块仅在对应使能有效时使用它们。
     output wire        csr_re,      // 读CSR旧值，供三条CSR指令写回rd
     output wire        csr_we,      // 本拍有效CSR写操作，在时钟沿更新CSR
     output wire [`CSR_NUM_WD-1:0] csr_num, // 本次访问的CSR编号
@@ -43,6 +44,7 @@ wire        WB_is_ertn;      // 当前锁存指令是否为ertn
 
 assign WB_readygo       = 1'b1;
 assign WB_allowin       = !WB_valid || WB_readygo;
+// 取消指令只清valid；WB_data可以保留旧内容，只有有效传输才锁存新数据。
 always @(posedge clk) begin
     if (reset || ertn_flush) begin
         WB_valid <= 1'b0;
@@ -67,20 +69,20 @@ assign {WB_pc_r,
         WB_csr_wvalue,
         WB_is_ertn} = WB_data;
 
-assign WB_pc       = WB_valid ? WB_pc_r : 32'b0;
+// 数据直接输出；无效拍的值无意义，由写使能、前递valid及调试端有效性判断屏蔽。
+assign WB_pc       = WB_pc_r;
 assign WB_rf_we    = WB_valid && WB_gr_we && !WB_is_ertn && !reset;
-assign WB_dest     = WB_valid ? WB_dest_r : 5'b0;
+assign WB_dest     = WB_dest_r;
 // 三条CSR指令均返回CSR旧值；后续CSR模块应先组合读旧值，再在时钟沿完成写入。
-assign WB_res      = !WB_valid ? 32'b0 :
-                     WB_csr_re ? csr_rvalue : WB_normal_res;
+assign WB_res      = WB_csr_re ? csr_rvalue : WB_normal_res;
 
 // valid为0时，流水寄存器中的残留控制位不得触发CSR读写或ertn返回。
 // CSR写使能不依赖rd是否为r0：即使丢弃读回值，指令仍可更新CSR。
 assign csr_re      = WB_valid && WB_csr_re && !reset;
 assign csr_we      = WB_valid && WB_csr_we && !reset;
-assign csr_num     = WB_valid ? WB_csr_num : {`CSR_NUM_WD{1'b0}};
-assign csr_wmask   = csr_we ? WB_csr_wmask : 32'b0;
-assign csr_wvalue  = csr_we ? WB_csr_wvalue : 32'b0;
+assign csr_num     = WB_csr_num;
+assign csr_wmask   = WB_csr_wmask;
+assign csr_wvalue  = WB_csr_wvalue;
 assign ertn_flush  = WB_valid && WB_is_ertn && !reset;
 
 assign ws_valid     = WB_valid;

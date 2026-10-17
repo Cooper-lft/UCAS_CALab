@@ -348,9 +348,9 @@ assign inst_csr     = inst_csrrd | inst_csrwr | inst_csrxchg;
 assign ID_csr_re     = inst_csr;
 assign ID_csr_we     = inst_csrwr | inst_csrxchg;
 assign ID_csr_num    = inst[23:10];
-assign ID_csr_wmask  = inst_csrwr   ? 32'hffffffff :
-                       inst_csrxchg ? rj_value : 32'b0;
-assign ID_csr_wvalue = ID_csr_we ? rkd_value : 32'b0;
+// 仅CSR写指令使用掩码/写入值；其余指令无需将这些字段置零，由WB的csr_we屏蔽。
+assign ID_csr_wmask  = inst_csrxchg ? rj_value : 32'hffffffff;
+assign ID_csr_wvalue = rkd_value;
 assign ID_is_ertn    = inst_ertn;
 
 assign inst_cond_branch = inst_beq  | inst_bne  | inst_blt  | inst_bge   | inst_bltu  | inst_bgeu;
