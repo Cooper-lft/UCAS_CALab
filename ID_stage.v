@@ -1,10 +1,16 @@
-`include "mycpu.h"
+`include "mycpu.vh"
 
 module ID_stage (
     input  wire        clk,
     input  wire        reset,
     input  wire        wb_ex,       // WB异常提交，优先清空本级年轻指令
     input  wire        ertn_flush,  // 来自WB：ertn本拍生效，取消ID中的年轻指令
+    input  wire        has_int,     // 当前有需要响应的中断，从csr.v中接入
+    // 以下三个信号表示：前面的CSR写指令或ertn将改变中断使能/状态，但修改尚未生效。
+    // ID必须等它们在WB完成更新后再判断中断；若ertn在WB生效，ID中的旧路径指令会被取消。
+    input  wire        int_state_pending_EX,  // 相关指令还在EX，尚未更新CSR
+    input  wire        int_state_pending_MEM, // 相关指令已到MEM，仍未更新CSR
+    input  wire        int_state_pending_WB,  // 相关指令已到WB，但要等本周期末的时钟沿才更新CSR
     
     input  wire        IF_to_ID_valid,
     input  wire [`IF_TO_ID_BUS_WD-1:0] IF_to_ID_bus,
@@ -48,14 +54,14 @@ reg [`IF_TO_ID_BUS_WD-1:0] ID_data; // from IF
 reg         ID_valid;
 wire        pipeline_flush;         // 异常提交和ertn返回共用清空控制。
 
-// 检测数据冲突
-/* 
-wire    rj_wait;
-wire    rk_wait;
-wire    rd_wait;
-*/
 wire        data_hazard;
 wire        csr_hazard;   // ID需要EX/MEM中CSR指令将写回的通用寄存器值，必须等待WB
+// 前面的指令将改变中断判断所用的CSR状态，而ID现在看到的还是旧状态，所以需要停顿。
+// 这与csr_hazard等待CSR指令返回的通用寄存器结果是两种不同的情况。
+wire        int_state_hazard;
+wire        ID_interrupt;
+wire        ID_has_exception;
+wire [`EXCEPTION_BUS_WD-1:0] ID_exception_flags;
 // 用于解决时序违例，而让涉及前递的跳转指令阻塞在ID级直到EX级指令流入MEM级
 wire        br_block;
 wire        br_need_rj;
@@ -68,10 +74,19 @@ wire [31:0] WB_wdata_forward;
 assign WB_wdata_forward = WB_rf_wdata;
 
 assign ID_allowin       = !ID_valid || ID_readygo && EX_allowin;
-// ertn后的指令可以继续流动；EX负责禁止其请求，WB异常或返回生效当拍停止ID发射。
-assign ID_readygo       = !data_hazard && !br_block && !csr_hazard && !pipeline_flush;
+// 教材7.3.4：前面的指令若要修改中断使能或中断状态，ID需等其在WB更新完成后再判断中断。
+// 等待期间ID指令不能进入EX，也不能触发分支跳转或锁存中断标记，避免使用尚未更新的状态。
+// 已发现异常的指令不需要正常操作数，可以不等通用寄存器结果；但仍需等待中断状态更新，
+// 因为更新后的状态决定它是否应被标记为优先级更高的INT异常。
+assign ID_readygo       = !reset && !pipeline_flush && !int_state_hazard &&
+                          (ID_has_exception || (!data_hazard && !br_block && !csr_hazard));
 assign pipeline_flush   = wb_ex || ertn_flush;
 assign ID_to_EX_valid   = ID_valid && ID_readygo;
+assign int_state_hazard = ID_valid && (int_state_pending_EX ||
+                                      int_state_pending_MEM || int_state_pending_WB);
+// 每拍根据当前has_int重新判断；只有ID指令被EX接收时，才保存它的INT标记。
+// 停顿期间不保存先前的判断结果，以免CSR已经更新，指令却仍带着按旧状态生成的中断标记。
+assign ID_interrupt = ID_valid && has_int && !int_state_hazard && !pipeline_flush && !reset;
 always @(posedge clk) begin
     if (reset || pipeline_flush) begin
         ID_valid <= 1'b0;
@@ -93,9 +108,11 @@ end
 
 wire [31:0] ID_pc;
 wire [31:0] inst;
+wire        ID_adef;
 
 assign {ID_pc,
-        inst}       = ID_data;
+        inst,
+        ID_adef}    = ID_data;
 
 wire        ID_rf_we;
 wire [ 4:0] ID_dest;
@@ -119,7 +136,6 @@ wire [`CSR_NUM_WD-1:0] ID_csr_num; // 从inst[23:10]提取的CSR编号
 wire [31:0] ID_csr_wmask;    // csrwr为全1；csrxchg取经过前递选择的GR[rj]
 wire [31:0] ID_csr_wvalue;   // 经过前递选择的GR[rd]，作为CSR写入数据
 wire        ID_is_ertn;      // 当前指令为ertn，到WB时据此产生ertn_flush
-wire        ID_is_syscall;   // syscall异常标记，随指令传至WB
 
 assign ID_to_EX_bus = {ID_pc,
                        ID_rf_we,
@@ -142,7 +158,7 @@ assign ID_to_EX_bus = {ID_pc,
                        ID_csr_wmask,
                        ID_csr_wvalue,
                        ID_is_ertn,
-                       ID_is_syscall};
+                       ID_exception_flags};
 
 
 // decode
@@ -229,6 +245,9 @@ wire        inst_csrxchg;
 wire        inst_ertn;
 wire        inst_csr;
 wire        inst_syscall;
+wire        inst_break;
+wire        inst_known;       // 当前真正实现的指令集合；合入rdcnt指令时需同步扩展
+wire        inst_ine;
 
 wire        inst_cond_branch;
 wire        inst_store;
@@ -352,15 +371,36 @@ assign inst_csrxchg = (inst[31:24] == `CSR_OPCODE) && (rj != 5'd0) && (rj != 5'd
 assign inst_ertn    = (inst == `INST_ERTN);
 assign inst_csr     = inst_csrrd | inst_csrwr | inst_csrxchg;
 assign inst_syscall = op_31_26_d[6'h00] & op_25_22_d[4'h0] & op_21_20_d[2'h2] & op_19_15_d[5'h16];
-assign ID_is_syscall = inst_syscall; // 这里只附加标记，真正异常提交发生在WB
+// break与syscall只用高17位识别，低15位code不参与指令类型判断或异常子码生成。
+assign inst_break   = op_31_26_d[6'h00] & op_25_22_d[4'h0] & op_21_20_d[2'h2] & op_19_15_d[5'h14];
 
-assign ID_csr_re     = inst_csr;
-assign ID_csr_we     = inst_csrwr | inst_csrxchg;
+assign inst_known   = inst_add_w    | inst_sub_w     | inst_slt         | inst_sltu     |
+                      inst_nor      | inst_and       | inst_or          | inst_xor      |
+                      inst_slli_w   | inst_srli_w    | inst_srai_w      | inst_addi_w   |
+                      inst_lu12i_w  | inst_pcaddu12i | inst_slti        | inst_sltui    |
+                      inst_andi     | inst_ori       | inst_xori        | inst_sll_w    | inst_srl_w | inst_sra_w   |
+                      inst_mul      | inst_mulh      | inst_mulhu       |
+                      inst_div_w    | inst_div_wu    | inst_mod_w       | inst_mod_wu   |
+                      inst_load     | inst_store     | inst_cond_branch | inst_jirl     | inst_b     | inst_bl      |
+                      inst_csr      | inst_ertn      | inst_syscall     | inst_break;
+assign inst_ine     = !inst_known;
+// 这里只附加异常信息，真正报告在WB。ADEF对应的RAM数据可无意义，不能据此正常执行。
+// INT优先于ADEF；ID的INE/BRK/SYS互斥，ALE留给EX检测。
+assign ID_exception_flags = {ID_interrupt, ID_adef, inst_ine, inst_break, inst_syscall, 1'b0};
+assign ID_has_exception = ID_exception_flags[`EXC_INT]  |
+                          ID_exception_flags[`EXC_ADEF] |
+                          ID_exception_flags[`EXC_INE]  |
+                          ID_exception_flags[`EXC_BRK]  |
+                          ID_exception_flags[`EXC_SYS]  |
+                          ID_exception_flags[`EXC_ALE];
+
+assign ID_csr_re     = inst_csr && !ID_has_exception;
+assign ID_csr_we     = (inst_csrwr | inst_csrxchg) && !ID_has_exception;
 assign ID_csr_num    = inst[23:10];
 // 仅CSR写指令使用掩码/写入值；其余指令无需将这些字段置零，由WB的csr_we屏蔽。
 assign ID_csr_wmask  = inst_csrxchg ? rj_value : 32'hffffffff;
 assign ID_csr_wvalue = rkd_value;
-assign ID_is_ertn    = inst_ertn;
+assign ID_is_ertn    = inst_ertn && !ID_has_exception;
 
 assign inst_cond_branch = inst_beq  | inst_bne  | inst_blt  | inst_bge   | inst_bltu  | inst_bgeu;
 assign inst_store       = inst_st_w | inst_st_b | inst_st_h;
@@ -428,10 +468,10 @@ assign ID_sel_rf_res    = inst_load;
 assign dst_is_r1        = inst_bl;
 
 // 涉及寄存器堆写操作
-assign gr_we            = ~inst_store & ~inst_cond_branch & ~inst_b & ~inst_ertn & ~inst_syscall;
+assign gr_we            = ~inst_store & ~inst_cond_branch & ~inst_b & ~inst_ertn & ~inst_syscall & ~inst_break & ~inst_ine;
 assign mem_we           = inst_store;
 assign ID_dest          = dst_is_r1 ? 5'd1 : rd;
-assign ID_rf_we         = gr_we && ID_valid;
+assign ID_rf_we         = gr_we && ID_valid && !ID_has_exception;
 
 assign rf_raddr1 = rj;
 assign rf_raddr2 = src_reg_is_rd ? rd :rk;
@@ -459,7 +499,7 @@ assign br_taken  = (   inst_beq  &&  rj_eq_rd
                     || inst_jirl
                     || inst_bl
                     || inst_b
-                   ) && ID_valid && ID_readygo && EX_allowin; // 注意只有在ID级指令能流向EX级时，br_taken才可能有效
+                   ) && ID_valid && ID_readygo && EX_allowin && !ID_has_exception; // 只有正常指令有效发射时才能改变取指PC；中断标记同样禁止跳转
 assign br_target = (inst_cond_branch || inst_bl || inst_b) ? (ID_pc + br_offs) :
                                                    /*inst_jirl*/ (rj_value_mem_wb + jirl_offs);
 // 复用原有MEM,WB前递通路，涉及前递的跳转指令的寄存器值只用MEM,WB级前递结果和寄存器堆的结果，不用EX级结果，避免时序违例
@@ -474,8 +514,8 @@ assign ID_alu_src1 = (src1_is_pc) ? ID_pc[31:0] :
                      (src1_is_0 ) ? 32'b0 : rj_value;
 assign ID_alu_src2 = (src2_is_imm)? imm   : rkd_value;
 
-assign ID_data_sram_we      = {4{mem_we && ID_valid}};
-assign ID_data_sram_en      = ID_valid && (inst_store || inst_load); 
+assign ID_data_sram_we      = {4{mem_we && ID_valid && !ID_has_exception}};
+assign ID_data_sram_en      = ID_valid && (inst_store || inst_load) && !ID_has_exception;
 assign ID_data_sram_wdata   = rkd_value;
 assign ID_mem_size          = (inst_ld_b | inst_ld_bu | inst_st_b) ? 2'b01 :
                               (inst_ld_h | inst_ld_hu | inst_st_h) ? 2'b10 : 

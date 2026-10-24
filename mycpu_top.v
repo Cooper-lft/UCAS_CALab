@@ -1,8 +1,9 @@
-`include "mycpu.h"
+`include "mycpu.vh"
 
 module mycpu_top(
     input  wire        clk,
     input  wire        resetn,
+    input  wire [ 7:0] hw_int, // exp13八路核外电平中断
     // inst sram interface
     output wire        inst_sram_en,
     output wire [ 3:0] inst_sram_we,
@@ -25,23 +26,31 @@ reg         reset;
 always @(posedge clk) reset <= ~resetn;
 
 // WB统一访问CSR；CSR返回旧值给WB，并提供ertn的返回地址给IF。
-wire        ertn_flush;  // WB -> 各流水级/CSR：返回生效，取消年轻指令并恢复状态
-wire [31:0] ertn_entry;  // CSR -> IF：返回目标地址，后续由ERA提供
-wire        wb_ex;       // WB -> 各流水级/CSR：正式提交SYS异常。
-wire [5:0]  wb_ecode;    // WB -> CSR：异常一级编码。
-wire [8:0]  wb_esubcode; // WB -> CSR：异常子码。
-wire [31:0] ex_entry;    // CSR -> IF：EENTRY异常入口。
-wire        mem_ex;      // MEM -> EX：较老syscall待提交，提前屏蔽访存。
-wire        csr_re;      // WB -> CSR：有效的读请求
-wire        csr_we;      // WB -> CSR：有效的写请求
-wire [`CSR_NUM_WD-1:0] csr_num; // WB -> CSR：读写共用的编号
-wire [31:0] csr_rvalue;  // CSR -> WB：更新前的旧值，写回rd并供WB前递使用
-wire [31:0] csr_wmask;   // WB -> CSR：逐位写掩码
-wire [31:0] csr_wvalue;  // WB -> CSR：来自原GR[rd]的写入数据
+wire        ertn_flush;             // WB -> 各流水级/CSR：返回生效，取消年轻指令并恢复状态
+wire [31:0] ertn_entry;             // CSR -> IF：返回目标地址，后续由ERA提供
+wire        wb_ex;                  // WB -> 各流水级/CSR：正式报告任意异常或中断。
+wire [31:0] WB_pc;
+wire [5:0]  wb_ecode;               // WB -> CSR：异常一级编码。
+wire [8:0]  wb_esubcode;            // WB -> CSR：异常子码。
+wire [31:0] ex_entry;               // CSR -> IF：EENTRY异常入口。
+wire        mem_ex;                 // MEM -> EX：前面的指令已检测到异常；在它到WB处理前，禁止EX发出访存和除法请求
+wire        has_int;                // CSR -> ID：当前有需要响应的中断
+wire [31:0] wb_vaddr;               // WB -> CSR：ALE的完整数据访存地址；ADEF的错误地址取WB_pc
+// 这三个信号通知ID：前面的CSR写指令或ertn将改变中断使能/状态，目前还不能使用新状态。
+// ID需暂停发射，等CSR在WB更新后再判断中断；ertn生效时则直接取消ID中的旧路径指令。
+wire        int_state_pending_EX;   // EX -> ID：相关指令还在EX，修改尚未生效
+wire        int_state_pending_MEM;  // MEM -> ID：相关指令已到MEM，修改仍未生效
+wire        int_state_pending_WB;   // WB -> ID：本周期结束的时钟沿才更新，ID本拍仍须等待
+wire        csr_re;                 // WB -> CSR：有效的读请求
+wire        csr_we;                 // WB -> CSR：有效的写请求
+wire [`CSR_NUM_WD-1:0] csr_num;     // WB -> CSR：读写共用的编号
+wire [31:0] csr_rvalue;             // CSR -> WB：更新前的旧值，写回rd并供WB前递使用
+wire [31:0] csr_wmask;              // WB -> CSR：逐位写掩码
+wire [31:0] csr_wvalue;             // WB -> CSR：来自原GR[rd]的写入数据
 // EX/MEM反馈给ID的指令类型标记，均已结合所在级的valid。
-wire        csr_in_EX;  // CSR返回值尚未就绪，相关的ID指令需等待
-wire        csr_in_MEM; // CSR仍需等到WB才能提供返回值
-wire        ertn_in_MEM;// MEM -> EX：禁止年轻访存或除法请求，等待WB统一清空
+wire        csr_in_EX;              // CSR返回值尚未就绪，相关的ID指令需等待
+wire        csr_in_MEM;             // CSR仍需等到WB才能提供返回值
+wire        ertn_in_MEM;            // MEM -> EX：禁止年轻访存或除法请求，等待WB统一清空
 
 csr u_csr (
     .clk        (clk        ),
@@ -52,8 +61,11 @@ csr u_csr (
     .csr_we     (csr_we     ),
     .csr_wmask  (csr_wmask  ),
     .csr_wvalue (csr_wvalue ),
+    .hw_int     (hw_int     ),
+    .has_int    (has_int    ),
     .wb_ex      (wb_ex      ),
     .wb_pc      (WB_pc      ),
+    .wb_vaddr   (wb_vaddr   ),
     .wb_ecode   (wb_ecode   ),
     .wb_esubcode(wb_esubcode),
     .ex_entry   (ex_entry   ),
@@ -110,6 +122,10 @@ ID_stage u_ID_stage (
     .reset              (reset            ),
     .wb_ex              (wb_ex            ),
     .ertn_flush         (ertn_flush       ),
+    .has_int            (has_int          ),
+    .int_state_pending_EX (int_state_pending_EX),
+    .int_state_pending_MEM(int_state_pending_MEM),
+    .int_state_pending_WB (int_state_pending_WB),
     .IF_to_ID_valid     (IF_to_ID_valid   ),
     .IF_to_ID_bus       (IF_to_ID_bus     ),
     .EX_allowin         (EX_allowin       ),
@@ -170,7 +186,8 @@ EX_stage u_EX_stage (
     .es_rf_we           (EX_rf_we           ),
     .load_in_EX         (load_in_EX         ),
     .EX_wdata_forward   (EX_wdata_forward   ),
-    .csr_in_EX          (csr_in_EX          )
+    .csr_in_EX          (csr_in_EX          ),
+    .int_state_pending_EX(int_state_pending_EX)
     );
 assign data_sram_en         = EX_data_sram_en;
 assign data_sram_we         = EX_data_sram_we;
@@ -202,11 +219,11 @@ MEM_stage u_MEM_stage (
     .MEM_wdata_forward      (MEM_wdata_forward      ),
     .csr_in_MEM             (csr_in_MEM             ),
     .ertn_in_MEM            (ertn_in_MEM            ),
-    .mem_ex                 (mem_ex                 )
+    .mem_ex                 (mem_ex                 ),
+    .int_state_pending_MEM   (int_state_pending_MEM  )
     );
 assign MEM_data_sram_rdata  = data_sram_rdata;
 
-wire [31:0] WB_pc;
 wire [ 4:0] WB_dest;
 wire [31:0] WB_res;
 WB_stage u_WB_stage (
@@ -229,7 +246,9 @@ WB_stage u_WB_stage (
     .ertn_flush         (ertn_flush     ),
     .wb_ex              (wb_ex          ),
     .wb_ecode           (wb_ecode       ),
-    .wb_esubcode        (wb_esubcode    )
+    .wb_esubcode        (wb_esubcode    ),
+    .wb_vaddr           (wb_vaddr       ),
+    .int_state_pending_WB(int_state_pending_WB)
     );
 assign WB_rf_wdata          = WB_res;
 assign WB_rf_waddr          = WB_dest;

@@ -1,4 +1,4 @@
-`include "mycpu.h"
+`include "mycpu.vh"
 
 module IF_stage (
     input  wire        clk,
@@ -6,7 +6,7 @@ module IF_stage (
     input  wire        wb_ex,       // WB异常提交，强制重定向并取消旧路径
     input  wire [31:0] ex_entry,    // CSR.EENTRY给出的异常入口
     input  wire        ertn_flush,  // 来自WB：丢弃当前旧指令，并立即改从返回地址取指
-    input  wire [31:0] ertn_entry,  // 来自CSR模块：ertn返回地址，后续由ERA提供
+    input  wire [31:0] ertn_entry,  // 来自CSR模块：ertn返回地址，由ERA提供
     // branch form ID
     input  wire        br_taken,
     input  wire [31:0] br_target,    
@@ -36,6 +36,8 @@ reg  [31:0] pc;
 wire [31:0] seq_pc;
 wire [31:0] nextpc;
 wire [31:0] inst;
+wire        nextpc_adef; // pre-IF检查即将请求的PC，按教材在发出请求之前检测
+reg         IF_adef;     // 与pc在同一边沿锁存，不能用下一次nextpc的异常标记当前指令
 
 assign IF_allowin       = !IF_valid || IF_readygo && ID_allowin;
 assign IF_readygo       = 1'b1;
@@ -49,7 +51,7 @@ always @(posedge clk) begin
         IF_valid <= 1'b0;
     end
     else if (pipeline_flush) begin // 清空优先于ID停顿和普通分支
-        // 旧路径由IF_to_ID_valid屏蔽；同一边沿请求新入口，不可再丢弃新返回指令
+        // 旧路径由IF_to_ID_valid屏蔽；新目标可能是正常取指，也可能是带ADEF的有效记录。
         IF_valid <= 1'b1;
     end
     else if (IF_allowin) begin
@@ -64,7 +66,9 @@ always @(posedge clk) begin
 end
 
 assign inst_sram_we     = 4'b0;
-assign inst_sram_en     = !reset && (IF_allowin || pipeline_flush); // 异常入口/返回请求不受ID停顿阻挡
+// 错误PC不向RAM发请求，但仍生成有效的ADEF记录，最终交由WB报告，不能在IF丢弃。
+assign nextpc_adef      = nextpc[1] | nextpc[0];
+assign inst_sram_en     = !reset && (IF_allowin || pipeline_flush) && !nextpc_adef; // 异常入口/返回请求不受ID停顿阻挡
 assign inst_sram_wdata  = 32'b0;
 assign inst             = inst_sram_rdata;
 assign inst_sram_addr   = nextpc;
@@ -75,14 +79,16 @@ assign nextpc       = wb_ex ? ex_entry :
                       ertn_flush ? ertn_entry :
                       br_taken ? br_target : seq_pc;
 
-assign IF_to_ID_bus = {pc[31:0], inst[31:0]};
+assign IF_to_ID_bus = {pc[31:0], inst[31:0], IF_adef};
 
 always @(posedge clk) begin
     if (reset) begin
         pc <= 32'h1bfffffc; //trick: to make nextpc be 0x1c000000 during reset
+        IF_adef <= 1'b0;
     end 
     else if(pipeline_flush || IF_allowin) begin
         pc <= nextpc;
+        IF_adef <= nextpc_adef;
     end
 end
 

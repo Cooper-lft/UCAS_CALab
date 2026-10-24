@@ -1,4 +1,4 @@
-`include "mycpu.h"
+`include "mycpu.vh"
 
 module WB_stage (
     input  wire        clk,
@@ -24,9 +24,14 @@ module WB_stage (
     output wire [31:0] csr_wvalue,  // 本次写操作的数据，来自ID取得的GR[rd]
     input  wire [31:0] csr_rvalue,  // CSR模块返回的旧值，也作为WB前递数据
     output wire        ertn_flush,   // 有效ertn到达WB时拉高，触发返回、状态恢复及清空
-    output wire        wb_ex,       // 有效syscall到达WB，真正提交SYS异常
+    output wire        wb_ex,       // 有效异常指令到达WB，统一报告异常并清空年轻指令
     output wire [5:0]  wb_ecode,    // 异常类型编码，送CSR.ESTAT
-    output wire [8:0]  wb_esubcode  // SYS子码固定为0
+    output wire [8:0]  wb_esubcode, // 本阶段所有已实现异常的子码均为0，包括ADEF
+    output wire [31:0] wb_vaddr,    // 交给CSR的完整数据地址；ADEF应改用wb_pc更新BADV
+    // WB中的CSR写指令或ertn将在本周期结束的时钟沿更新中断使能或中断状态。
+    // ID在本周期内看到的仍是更新前的值，所以即使前面的指令已经到WB，ID也不能提前发射。
+    // CSR写入生效后再判断中断；若是ertn，当前ID指令会被ertn_flush取消。
+    output wire        int_state_pending_WB
 );
 
 wire       WB_readygo;
@@ -45,7 +50,9 @@ wire [`CSR_NUM_WD-1:0] WB_csr_num; // 当前锁存指令的CSR编号
 wire [31:0] WB_csr_wmask;    // 从ID一路携带至此的写掩码
 wire [31:0] WB_csr_wvalue;   // 从ID一路携带至此的写入值
 wire        WB_is_ertn;      // 当前锁存指令是否为ertn
-wire        WB_is_syscall;
+wire [`EXCEPTION_BUS_WD-1:0] WB_exception_flags;
+wire        WB_has_exception;
+wire [31:0] WB_vaddr;
 
 assign WB_readygo       = 1'b1;
 assign WB_allowin       = !WB_valid || WB_readygo;
@@ -77,7 +84,8 @@ assign {WB_pc_r,
         WB_csr_wmask,
         WB_csr_wvalue,
         WB_is_ertn,
-        WB_is_syscall} = WB_data;
+        WB_exception_flags,
+        WB_vaddr} = WB_data;
 
 // 数据直接输出；无效拍的值无意义，由写使能、前递valid及调试端有效性判断屏蔽。
 assign WB_pc       = WB_pc_r;
@@ -93,10 +101,26 @@ assign csr_we      = WB_valid && WB_csr_we && !pipeline_flush && !reset;
 assign csr_num     = WB_csr_num;
 assign csr_wmask   = WB_csr_wmask;
 assign csr_wvalue  = WB_csr_wvalue;
-assign wb_ex       = WB_valid && WB_is_syscall && !reset;
-assign wb_ecode    = `ECODE_SYS;
-assign wb_esubcode = `ESUBCODE_SYS;
+assign WB_has_exception = WB_exception_flags[`EXC_INT]  |
+                          WB_exception_flags[`EXC_ADEF] |
+                          WB_exception_flags[`EXC_INE]  |
+                          WB_exception_flags[`EXC_BRK]  |
+                          WB_exception_flags[`EXC_SYS]  |
+                          WB_exception_flags[`EXC_ALE];
+assign wb_ex       = WB_valid && WB_has_exception && !reset;
+// 手册6.2.2：同一条指令INT优先，其后为取指、译码、执行异常;(译码级例外)INE/BRK/SYS译码互斥。
+// 不同指令的异常由顺序到达WB及冲刷保证较老指令优先，不能用类型优先级越过较老指令。
+assign wb_ecode    = WB_exception_flags[`EXC_INT]  ? `ECODE_INT :
+                     WB_exception_flags[`EXC_ADEF] ? `ECODE_ADE :
+                     WB_exception_flags[`EXC_INE]  ? `ECODE_INE :
+                     WB_exception_flags[`EXC_BRK]  ? `ECODE_BRK :
+                     WB_exception_flags[`EXC_SYS]  ? `ECODE_SYS :
+                     WB_exception_flags[`EXC_ALE]  ? `ECODE_ALE : `ECODE_INT;
+assign wb_esubcode = 9'b0;
+assign wb_vaddr    = WB_vaddr;
 assign ertn_flush  = WB_valid && WB_is_ertn && !wb_ex && !reset;
+assign int_state_pending_WB = WB_valid && !reset && !WB_has_exception &&
+                              (WB_is_ertn || (WB_csr_we && `CSR_INT_RELATED(WB_csr_num)));
 
 assign ws_valid     = WB_valid;
 

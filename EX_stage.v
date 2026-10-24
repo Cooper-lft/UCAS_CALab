@@ -1,10 +1,10 @@
-`include "mycpu.h"
+`include "mycpu.vh"
 
 module EX_stage (
     input  wire        clk,
     input  wire        reset,
     input  wire        wb_ex,       // WB提交异常，清空EX并屏蔽所有请求
-    input  wire        mem_ex,      // 较老的syscall在MEM，年轻指令不得提前访存
+    input  wire        mem_ex,      // MEM中有任意有效异常，年轻指令不得提前访存
     input  wire        ertn_flush,  // 来自WB：清除本级valid及除法控制状态，并禁止访存
     input  wire        ertn_in_MEM, // MEM中有有效ertn，禁止EX年轻指令发出访存或除法请求
 
@@ -26,7 +26,10 @@ module EX_stage (
     output wire         es_rf_we,
     output wire         load_in_EX,        // EX中有有效load，用于ID的load-use停顿判断
     output wire [ 31:0] EX_wdata_forward,   // 由EX级前递的数据
-    output wire         csr_in_EX    // 已结合EX_valid的CSR指令标记，通知ID返回值尚未就绪
+    output wire         csr_in_EX,   // 已结合EX_valid的CSR指令标记，通知ID返回值尚未就绪
+    // EX中有一条会修改中断使能或中断状态的CSR写指令，或者一条将恢复CRMD.IE的ertn。
+    // 它们还没有到WB，CSR中的状态仍是旧值；ID需要暂停发射，不能根据这些旧值标记中断。
+    output wire         int_state_pending_EX
 );
     
 wire        EX_readygo;    
@@ -97,15 +100,29 @@ wire [`CSR_NUM_WD-1:0] EX_csr_num; // CSR编号
 wire [31:0] EX_csr_wmask;     // ID已取得的写掩码
 wire [31:0] EX_csr_wvalue;    // ID已取得的写入值，后续不再重新读取GR[rd]
 wire        EX_is_ertn;       // ertn标记随指令流向WB
-wire        EX_is_syscall;    // 本级锁存的系统调用异常标记
+wire [`EXCEPTION_BUS_WD-1:0] EX_exception_flags_in; // 从ID锁存，含中断和取指/译码异常
+wire [`EXCEPTION_BUS_WD-1:0] EX_exception_flags;    // 合入本拍ALE后的完整异常信息
+wire        EX_ale;
+wire        EX_has_exception;
 wire        EX_request_allowed; // 本拍允许访存或启动除法；地址和数据无需因取消而清零
-// 自身syscall、较老MEM异常或ertn、WB异常或返回均禁止年轻指令产生请求。
-// EX_is_syscall来自本级流水寄存器；mem_ex、wb_ex分别来自MEM、WB的有效异常标记。
-assign EX_request_allowed = EX_valid && !reset && !EX_is_syscall && !mem_ex &&
-                            !ertn_in_MEM && !pipeline_flush;
+
+// 教材7.3.1.2：在EX发请求之前判断ALE。字访问检查低两位，半字检查最低位，字节无需对齐。
+assign EX_ale = EX_mem_en && (((EX_mem_size == 2'b00) && (EX_alu_res[1] | EX_alu_res[0])) ||
+                              ((EX_mem_size == 2'b10) && EX_alu_res[0]));
+// ALE为异常向量最低位，其余位来自ID；各级检测，WB按手册优先级统一选择原因。
+assign EX_exception_flags = EX_exception_flags_in | {{(`EXCEPTION_BUS_WD-1){1'b0}}, EX_ale};
+assign EX_has_exception = EX_exception_flags[`EXC_INT]  |
+                          EX_exception_flags[`EXC_ADEF] |
+                          EX_exception_flags[`EXC_INE]  |
+                          EX_exception_flags[`EXC_BRK]  |
+                          EX_exception_flags[`EXC_SYS]  |
+                          EX_exception_flags[`EXC_ALE];
+// 自身任意异常（含当拍ALE）、较老MEM异常或ertn、WB异常或返回均禁止发出请求。
+assign EX_request_allowed = EX_valid && !reset && !EX_has_exception && !mem_ex && !ertn_in_MEM && !pipeline_flush;
 
 // EX_readygo置1，要不然是非除法指令，要不然是除法指令且结果已经拿到下，下一拍就能送入MEM级(div_result_valid)或者EX级中有除法器结果的缓存（div_done）
-assign EX_readygo       = !EX_is_div || div_done || div_result_valid;
+// 被标记中断的除法不启动IP，也不能等待除法结果；异常记录直接向WB传递。
+assign EX_readygo       = EX_has_exception || !EX_is_div || div_done || div_result_valid;
 assign EX_to_MEM_valid  = EX_valid && EX_readygo && !pipeline_flush;
 assign EX_allowin       = !EX_valid || EX_to_MEM_valid && MEM_allowin;
 assign pipeline_flush   = wb_ex || ertn_flush;
@@ -139,7 +156,8 @@ assign EX_to_MEM_bus    = {EX_pc,
                             EX_csr_wmask,
                             EX_csr_wvalue,
                             EX_is_ertn,
-                            EX_is_syscall
+                            EX_exception_flags,
+                            EX_alu_res          // 完整有效地址随指令传递，供ALE更新BADV
                             };
 
 assign EX_wdata         = (EX_is_div)? div_result : EX_alu_res;
@@ -164,7 +182,7 @@ assign {EX_pc,
         EX_csr_wmask,
         EX_csr_wvalue,
         EX_is_ertn,
-        EX_is_syscall}            = EX_data;
+        EX_exception_flags_in}    = EX_data;
 
 assign EX_store_mask        = (EX_mem_size == 2'b01) ? (4'b0001 << EX_alu_res[1:0]) :
                               (EX_mem_size == 2'b10) ? (EX_alu_res[1] ? 4'b1100 : 4'b0011) :
@@ -183,17 +201,22 @@ alu u_alu(
     );
 
 assign  es_valid    = EX_valid;
-assign  es_rf_we    = EX_rf_we;
+assign  es_rf_we    = EX_rf_we && !EX_has_exception;
 assign  es_dest     = EX_dest;
 
 // 向ID报告结果尚未就绪的指令：load要等MEM，CSR要等WB。
 // 根据指令属性判断load，避免将是否允许发出访存请求混入类型判断。
-assign  load_in_EX          = EX_valid && EX_sel_rf_res;
+assign  load_in_EX          = EX_valid && EX_sel_rf_res && !EX_has_exception;
 assign  EX_wdata_forward    = EX_wdata;
-assign  csr_in_EX           = EX_valid && EX_csr_re;
+assign  csr_in_EX           = EX_valid && EX_csr_re && !EX_has_exception;
+// 只有写CRMD、ECFG、ESTAT、TCFG、TICLR，或执行ertn，才可能改变ID判断中断所用的状态。
+// 普通CSR读不修改状态；ERA/PRMD的写入也不直接影响has_int，因此不触发这里的等待。
+assign int_state_pending_EX = EX_valid && !reset && !EX_has_exception &&
+                              (EX_is_ertn || (EX_csr_we && `CSR_INT_RELATED(EX_csr_num)));
 
 // 除法器：
-// 较老syscall或ertn待提交时不启动年轻除法，避免冲刷后IP仍返回被取消指令的结果。
+// 本条指令已带异常，或前面的指令将触发异常/ertn返回时，不向除法器发送新的操作数。
+// 否则流水线虽然随后被清空，除法器仍可能返回已被取消指令的结果，干扰返回后的新除法。
 assign div_req                  = EX_request_allowed && EX_is_div && !div_done && !div_sent;
 assign dividend_tvalid_signed   = div_req   && EX_div_signed;
 assign divisor_tvalid_signed    = dividend_tvalid_signed;

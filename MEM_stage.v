@@ -1,4 +1,4 @@
-`include "mycpu.h"
+`include "mycpu.vh"
 
 module MEM_stage (
     input  wire        clk,
@@ -22,7 +22,11 @@ module MEM_stage (
     output wire [31:0] MEM_wdata_forward,
     output wire        csr_in_MEM,  // 已结合MEM_valid的CSR标记，通知ID继续等待WB返回值
     output wire        ertn_in_MEM, // 已结合MEM_valid的ertn标记，通知EX禁止年轻访存和除法请求
-    output wire        mem_ex       // 有效syscall位于MEM时，通知EX提前屏蔽访存。
+    output wire        mem_ex,      // 任意有效异常位于MEM时，通知EX提前屏蔽请求
+    // MEM中有一条会影响中断判断的CSR写指令或ertn，但这些修改要到WB才生效。
+    // ID此时判断是否响应中断，可能使用修改前的旧状态，因此需要暂停发射，等待较老指令完成状态更新
+    // 若是ertn，则由它在WB产生的冲刷取消ID中的年轻指令。
+    output wire        int_state_pending_MEM
 );
 
 wire       MEM_readygo;
@@ -69,7 +73,9 @@ wire [`CSR_NUM_WD-1:0] MEM_csr_num; // CSR编号
 wire [31:0] MEM_csr_wmask;    // 随指令传递的写掩码
 wire [31:0] MEM_csr_wvalue;   // 随指令传递的写入值
 wire        MEM_is_ertn;      // 到WB后产生返回生效信号
-wire        MEM_is_syscall;   // 锁存并向WB传递的SYS异常标记
+wire [`EXCEPTION_BUS_WD-1:0] MEM_exception_flags; // 锁存并向WB传递的全部异常标记
+wire        MEM_has_exception;
+wire [31:0] MEM_vaddr;        // EX计算的完整访存地址，与MEM选择出的load结果分开保存
 
 assign {MEM_pc,
         MEM_rf_we,
@@ -85,7 +91,8 @@ assign {MEM_pc,
         MEM_csr_wmask,
         MEM_csr_wvalue,
         MEM_is_ertn,
-        MEM_is_syscall}         = MEM_data;
+        MEM_exception_flags,
+        MEM_vaddr}              = MEM_data;
 
 assign MEM_to_WB_bus        = {MEM_pc,
                               MEM_rf_we,
@@ -97,7 +104,8 @@ assign MEM_to_WB_bus        = {MEM_pc,
                               MEM_csr_wmask,
                               MEM_csr_wvalue,
                               MEM_is_ertn,
-                              MEM_is_syscall};
+                              MEM_exception_flags,
+                              MEM_vaddr};
                             // when MEM_sel_rf_res == 1, final result is from data_sram(load inst)
 assign MEM_load_byte        = (MEM_addr_low == 2'b00) ? MEM_data_sram_rdata[ 7:0]  :
                               (MEM_addr_low == 2'b01) ? MEM_data_sram_rdata[15:8]  :
@@ -113,11 +121,19 @@ assign MEM_res              = (MEM_sel_rf_res) ? MEM_load_res : MEM_alu_res;
 // forward
 assign ms_valid             = MEM_valid;
 assign ms_dest              = MEM_dest;
-assign ms_rf_we             = MEM_rf_we;
+assign ms_rf_we             = MEM_rf_we && !MEM_has_exception;
 assign MEM_wdata_forward    = MEM_res;
-assign csr_in_MEM           = MEM_valid && MEM_csr_re;
-assign ertn_in_MEM          = MEM_valid && MEM_is_ertn;
-assign mem_ex               = MEM_valid && MEM_is_syscall;
+assign MEM_has_exception    = MEM_exception_flags[`EXC_INT]  |
+                              MEM_exception_flags[`EXC_ADEF] |
+                              MEM_exception_flags[`EXC_INE]  |
+                              MEM_exception_flags[`EXC_BRK]  |
+                              MEM_exception_flags[`EXC_SYS]  |
+                              MEM_exception_flags[`EXC_ALE];
+assign csr_in_MEM           = MEM_valid  && MEM_csr_re  && !MEM_has_exception;
+assign ertn_in_MEM          = MEM_valid  && MEM_is_ertn && !MEM_has_exception;
+assign mem_ex               = MEM_valid  && MEM_has_exception;
+assign int_state_pending_MEM = MEM_valid   && !reset       && !MEM_has_exception &&
+                              (MEM_is_ertn || (MEM_csr_we  && `CSR_INT_RELATED(MEM_csr_num)));
 
 
 endmodule

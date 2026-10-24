@@ -1,5 +1,5 @@
 
-`include "mycpu.h"
+`include "mycpu.vh"
 
 module csr (
     input  wire                   clk,
@@ -14,10 +14,15 @@ module csr (
     input  wire [31:0]            csr_wmask,   // 写掩码：1表示请求更新该位，仍需遵守CSR各位的读写属性
     input  wire [31:0]            csr_wvalue,  // 写入值，来自指令执行前的GR[rd]
 
+    // exp13第1/2项与第3项的协作接口，CSR和定时器内部逻辑由负责第3项的同学接入。
+    input  wire [7:0]             hw_int,      // 八路硬中断，后续逐拍采样到ESTAT.IS[9:2]
+    output wire                   has_int,     // CRMD.IE开启，且至少一路挂起中断的局部使能开启
+
     // wb_ex为1表示本拍有异常需要提交；wb_pc是异常指令自身的PC。
     // wb_ecode/wb_esubcode描述异常原因，例如syscall对应6'h0b和9'b0。
     input  wire                   wb_ex,
     input  wire [31:0]            wb_pc,
+    input  wire [31:0]            wb_vaddr,    // ALE时写BADV的完整地址；ADEF时BADV应取wb_pc
     input  wire [5:0]             wb_ecode,
     input  wire [8:0]             wb_esubcode,
     output wire [31:0]            ex_entry,    // 普通异常入口，由EENTRY提供
@@ -27,7 +32,20 @@ module csr (
     output wire [31:0]            ertn_entry   // 返回目标地址，后续由CSR.ERA提供给IF级
 );
 
-// crmd：挡墙特权级plv，中断使能ie，直接访问da，映射地址pg，
+// 第3项尚未合入：缺少ECFG和定时器/硬中断状态，暂关闭中断，避免未驱动输出污染流水线。
+// 合入时将本行替换为教材7.2.2.1的has_int公式：
+// wire [12:0] int_pending = estat_is[12:0] & ecfg_lie[12:0];
+// assign has_int = crmd_ie && (int_pending[12] | int_pending[11] | int_pending[10] |
+//                              int_pending[9]  | int_pending[8]  | int_pending[7]  |
+//                              int_pending[6]  | int_pending[5]  | int_pending[4]  |
+//                              int_pending[3]  | int_pending[2]  | int_pending[1]  |
+//                              int_pending[0]);
+// hw_int需采样到ESTAT，IS[1:0]来自软件写，IS[11]由定时器置位、TICLR写1清除。
+// BADV须按WB最终选中的异常更新：wb_ex && ECODE_ADE/子码0取wb_pc，ECODE_ALE取wb_vaddr。
+// 当前仅预留hw_int/wb_vaddr输入，不提前实现同学负责的第3项CSR和定时器。
+assign has_int = 1'b0;
+
+// crmd：特权级plv，中断使能ie，直接地址翻译模式da，映射地址翻译模式pg，
 // PLV对应[1:0]，IE对应[2]；DA/PG对应[3]/[4]，选择地址翻译模式。
 // DATF对应[6:5]、DATM对应[8:7]，分别记录直接地址翻译模式下取指和数据访存的属性。
 reg [1:0] crmd_plv;
@@ -145,29 +163,15 @@ end
 
 // SAVE0~3：按csr_num选中一个寄存器，再对其32位数据进行掩码写。
 always @(posedge clk) begin
-    if (reset) begin
-        save0 <= 32'b0;
-        save1 <= 32'b0;
-        save2 <= 32'b0;
-        save3 <= 32'b0;
-    end
-    else if (csr_write) begin
-        case (csr_num)
-            `CSR_SAVE0:
-                save0 <= (save0 & ~csr_wmask) | (csr_wvalue & csr_wmask);
-
-            `CSR_SAVE1:
-                save1 <= (save1 & ~csr_wmask) | (csr_wvalue & csr_wmask);
-
-            `CSR_SAVE2:
-                save2 <= (save2 & ~csr_wmask) | (csr_wvalue & csr_wmask);
-
-            `CSR_SAVE3:
-                save3 <= (save3 & ~csr_wmask) | (csr_wvalue & csr_wmask);
-        endcase
-    end
+    if (csr_write && csr_num==`CSR_SAVE0)
+        save0 <= (csr_wmask & csr_wvalue | ~csr_wmask & save0);
+    if (csr_write && csr_num==`CSR_SAVE1)
+        save1 <= (csr_wmask & csr_wvalue | ~csr_wmask & save1);
+    if (csr_write && csr_num==`CSR_SAVE2)
+        save2 <= (csr_wmask & csr_wvalue | ~csr_wmask & save2);
+    if (csr_write && csr_num==`CSR_SAVE3)
+        save3 <= (csr_wmask & csr_wvalue | ~csr_wmask & save3);
 end
-
 
 wire [31:0] crmd_value;
 wire [31:0] prmd_value;

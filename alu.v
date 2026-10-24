@@ -1,4 +1,4 @@
-`include "mycpu.h"
+`include "mycpu.vh"
 
 module alu(
   input  wire [`ALU_OP_WD-1:0] alu_op,
