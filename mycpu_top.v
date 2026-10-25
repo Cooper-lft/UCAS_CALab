@@ -3,7 +3,7 @@
 module mycpu_top(
     input  wire        clk,
     input  wire        resetn,
-    input  wire [ 7:0] hw_int, // exp13八路核外电平中断
+
     // inst sram interface
     output wire        inst_sram_en,
     output wire [ 3:0] inst_sram_we,
@@ -55,13 +55,14 @@ wire        ertn_in_MEM;            // MEM -> EX：禁止年轻访存或除法�
 csr u_csr (
     .clk        (clk        ),
     .reset      (reset      ),
+    .coreid_in  (32'b0      ),
     .csr_re     (csr_re     ),
     .csr_num    (csr_num    ),
     .csr_rvalue (csr_rvalue ),
     .csr_we     (csr_we     ),
     .csr_wmask  (csr_wmask  ),
     .csr_wvalue (csr_wvalue ),
-    .hw_int     (hw_int     ),
+    .hw_int     (8'h00      ),
     .has_int    (has_int    ),
     .wb_ex      (wb_ex      ),
     .wb_pc      (WB_pc      ),

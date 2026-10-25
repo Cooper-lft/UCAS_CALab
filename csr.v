@@ -4,6 +4,7 @@
 module csr (
     input  wire                   clk,
     input  wire                   reset,
+    input  wire [31:0]            coreid_in,   // 单核编号，复位时作为TID的初值
 
     // 以下请求均来自WB级，仅在有效指令到达WB时使能。
     // csr_re/csr_we为0时应忽略对应编号和数据，无需要求它们也变为0。
@@ -14,7 +15,7 @@ module csr (
     input  wire [31:0]            csr_wmask,   // 写掩码：1表示请求更新该位，仍需遵守CSR各位的读写属性
     input  wire [31:0]            csr_wvalue,  // 写入值，来自指令执行前的GR[rd]
 
-    // exp13第1/2项与第3项的协作接口，CSR和定时器内部逻辑由负责第3项的同学接入。
+    // 中断状态在CSR内部维护，has_int送ID为当前有效指令附加中断标记。
     input  wire [7:0]             hw_int,      // 八路硬中断，后续逐拍采样到ESTAT.IS[9:2]
     output wire                   has_int,     // CRMD.IE开启，且至少一路挂起中断的局部使能开启
 
@@ -32,18 +33,10 @@ module csr (
     output wire [31:0]            ertn_entry   // 返回目标地址，后续由CSR.ERA提供给IF级
 );
 
-// 第3项尚未合入：缺少ECFG和定时器/硬中断状态，暂关闭中断，避免未驱动输出污染流水线。
-// 合入时将本行替换为教材7.2.2.1的has_int公式：
-// wire [12:0] int_pending = estat_is[12:0] & ecfg_lie[12:0];
-// assign has_int = crmd_ie && (int_pending[12] | int_pending[11] | int_pending[10] |
-//                              int_pending[9]  | int_pending[8]  | int_pending[7]  |
-//                              int_pending[6]  | int_pending[5]  | int_pending[4]  |
-//                              int_pending[3]  | int_pending[2]  | int_pending[1]  |
-//                              int_pending[0]);
-// hw_int需采样到ESTAT，IS[1:0]来自软件写，IS[11]由定时器置位、TICLR写1清除。
-// BADV须按WB最终选中的异常更新：wb_ex && ECODE_ADE/子码0取wb_pc，ECODE_ALE取wb_vaddr。
-// 当前仅预留hw_int/wb_vaddr输入，不提前实现同学负责的第3项CSR和定时器。
-assign has_int = 1'b0;
+// 中断有效条件：全局使能开启，且至少一路挂起中断的局部使能开启。
+wire [12:0] estat_is;   // 各中断源拼合后的状态，区别于异常原因编码
+assign estat_is = {1'b0, estat_timer_is, 1'b0, estat_hw_is, estat_sw_is};
+assign has_int = ((estat_is & ecfg_lie) != 13'b0) && crmd_ie;
 
 // crmd：特权级plv，中断使能ie，直接地址翻译模式da，映射地址翻译模式pg，
 // PLV对应[1:0]，IE对应[2]；DA/PG对应[3]/[4]，选择地址翻译模式。
@@ -62,12 +55,25 @@ assign crmd_datm = 2'b00;   // 数据访问属性暂为常值
 // PPLV/PIE对应PRMD[1:0]/[2]，供ertn恢复到CRMD。
 reg [1:0] prmd_pplv;
 reg       prmd_pie;
-// estat 当前的方法
-// ESTAT：软件中断状态、异常码；本实验尚未接入其它中断源。
+// ECFG.LIE[12:0]为局部中断使能，保留位[10]不能写成1。
+reg [12:0] ecfg_lie;
+// ESTAT.IS[1:0]由软件写，[9:2]采样硬中断，[11]由定时器置起、TICLR写1清除。
 // sw_is对应[1:0]；ecode/esubcode分别对应[21:16]/[30:22]。
 reg [1:0] estat_sw_is;  
+reg [7:0] estat_hw_is;
+reg       estat_timer_is;
 reg [5:0] estat_ecode;
 reg [8:0] estat_esubcode;
+// BADV只在最终提交地址异常时记录错误地址，软件写无效。
+reg [31:0] badv;
+// TID为计时器编号；TCFG控制另一个32位倒计时器，与rdcntv的64位计数器相互独立。
+reg [31:0] tid;
+reg        tcfg_en;
+reg        tcfg_periodic;
+reg [29:0] tcfg_initval;
+reg [31:0] timer_cnt;
+wire [31:0] tcfg_next_value;    //本次掩码写之后的完整TCFG值
+wire        ticlr_clr;          // 写1清除只捕获写动作，读值恒为0
 // 异常返回地址
 reg [31:0] era;
 
@@ -127,6 +133,14 @@ always @(posedge clk) begin
     end
 end
 
+// ECFG仅由软件更新，13'h1bff保证保留位[10]始终为0。
+always @(posedge clk) begin
+    if (reset)
+        ecfg_lie <= 13'b0;
+    else if (csr_write && csr_num == `CSR_ECFG)
+        ecfg_lie <= ((ecfg_lie & ~csr_wmask[12:0]) | (csr_wvalue[12:0] & csr_wmask[12:0])) & 13'h1bff;
+end
+
 // estat只有is[1:0]可由csr指令写入；Ecode/EsubCode由异常提交更新。
 always @(posedge clk) begin
     if (reset) begin
@@ -143,6 +157,73 @@ always @(posedge clk) begin
         end
     end
 end
+
+// 硬中断为电平输入，每拍采样；定时器中断则保持置位，不能简单采样timer_cnt是否为0。
+always @(posedge clk) begin
+    if (reset)
+        estat_hw_is <= 8'b0;
+    else
+        estat_hw_is <= hw_int;
+end
+
+always @(posedge clk) begin
+    if (reset)
+        estat_timer_is <= 1'b0;
+    else if (tcfg_en && timer_cnt == 32'b0)     // 到0置位优先于同拍软件清除，尽量避免漏掉中断
+        estat_timer_is <= 1'b1;
+    else if (csr_write && csr_num == `CSR_TICLR && csr_wmask[0] && csr_wvalue[0])
+        estat_timer_is <= 1'b0;                 // 写0或掩码为0均不清除
+end
+
+// BADV按WB最终选中的异常更新；INT等高优先级异常不能误写BADV。
+always @(posedge clk) begin
+    if (reset)
+        badv <= 32'b0;
+    else if (wb_ex && wb_ecode == `ECODE_ADE && wb_esubcode == 9'b0)    // 当前仅有ADEF
+        badv <= wb_pc;
+    else if (wb_ex && wb_ecode == `ECODE_ALE)
+        badv <= wb_vaddr;   // 使用完整有效地址，不能使用load结果或地址低两位
+end
+
+// TID按核编号复位，软件可通过csrwr或csrxchg修改，rdcntid在WB读取它。
+always @(posedge clk) begin
+    if (reset)
+        tid <= coreid_in;
+    else if (csr_write && csr_num == `CSR_TID)
+        tid <= (tid & ~csr_wmask) | (csr_wvalue & csr_wmask);
+end 
+
+// 先计算本次掩码写的新配置，装载计数器时必须使用新InitVal，不能使用旧寄存器值。
+assign tcfg_next_value = (csr_wmask & csr_wvalue) |
+                         (~csr_wmask & {tcfg_initval, tcfg_periodic, tcfg_en});
+always @(posedge clk) begin
+    if (reset) begin
+        tcfg_en       <= 1'b0;
+        tcfg_periodic <= 1'b0;
+        tcfg_initval  <= 30'b0;
+    end
+    else if (csr_write && csr_num == `CSR_TCFG) begin
+        tcfg_en       <= tcfg_next_value[0];
+        tcfg_periodic <= tcfg_next_value[1];
+        tcfg_initval  <= tcfg_next_value[31:2];
+    end
+end
+
+// 定时器：写TCFG且新En为1时装载；使能后每拍减1；周期模式到0后重新装载。
+// 非周期模式到0后减成32'hffffffff并停住，关闭使能或装载新值均不自动清中断。
+always @(posedge clk) begin
+    if (reset)
+        timer_cnt <= 32'hffffffff;
+    else if (csr_write && csr_num == `CSR_TCFG && tcfg_next_value[0])
+        timer_cnt <= {tcfg_next_value[31:2], 2'b0};     // 初值为InitVal乘4
+    else if (tcfg_en && timer_cnt != 32'hffffffff) begin
+        if (timer_cnt == 32'b0 && tcfg_periodic)
+            timer_cnt <= {tcfg_initval, 2'b0};
+        else
+            timer_cnt <= timer_cnt - 1'b1;
+    end
+end
+assign ticlr_clr = 1'b0;    // TICLR.CLR为W1属性，读出恒为0，无需专门的寄存器
 
 always @(posedge clk) begin
     if (reset)
@@ -176,12 +257,16 @@ end
 wire [31:0] crmd_value;
 wire [31:0] prmd_value;
 wire [31:0] estat_value;
+wire [31:0] ecfg_value;
+wire [31:0] tcfg_value;
 wire [31:0] csr_read_data;
 
 assign crmd_value = {23'b0, crmd_datm, crmd_datf, crmd_pg, crmd_da, crmd_ie, crmd_plv};
 assign prmd_value = {29'b0, prmd_pie, prmd_pplv};
-// ESTAT依次为：保留位、异常子码、异常码、保留位、其它中断位、软件中断位。
-assign estat_value = {1'b0, estat_esubcode, estat_ecode, 3'b0, 11'b0, estat_sw_is};
+// ESTAT依次为：保留位、异常子码、异常码、保留位、13位中断状态。
+assign estat_value = {1'b0, estat_esubcode, estat_ecode, 3'b0, estat_is};
+assign ecfg_value  = {19'b0, ecfg_lie};
+assign tcfg_value  = {tcfg_initval, tcfg_periodic, tcfg_en};
 
 assign csr_read_data = ({32{csr_num == `CSR_CRMD  }} & crmd_value)
                      | ({32{csr_num == `CSR_PRMD  }} & prmd_value)
@@ -191,7 +276,14 @@ assign csr_read_data = ({32{csr_num == `CSR_CRMD  }} & crmd_value)
                      | ({32{csr_num == `CSR_SAVE0 }} & save0)
                      | ({32{csr_num == `CSR_SAVE1 }} & save1)
                      | ({32{csr_num == `CSR_SAVE2 }} & save2)
-                     | ({32{csr_num == `CSR_SAVE3 }} & save3);
+                     | ({32{csr_num == `CSR_SAVE3 }} & save3)
+                     | ({32{csr_num == `CSR_ECFG  }} & ecfg_value)
+                     | ({32{csr_num == `CSR_BADV  }} & badv)
+                     | ({32{csr_num == `CSR_TID   }} & tid)
+                     | ({32{csr_num == `CSR_TCFG  }} & tcfg_value)
+                     | ({32{csr_num == `CSR_TVAL  }} & timer_cnt)   // TVAL只读，直接返回倒计时器当前值
+                     | ({32{csr_num == `CSR_TICLR }} & {31'b0, ticlr_clr});
+
 // 当csr-re = 1  的时候才进行并
 assign csr_rvalue = {32{csr_re}} & csr_read_data;
 // 返回地址与异常入口持续输出，不受csr_re或当前csr_num的影响。

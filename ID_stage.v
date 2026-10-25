@@ -128,11 +128,13 @@ wire        ID_div_signed;  // 有符号运算(求商或者取余)
 wire        ID_div_is_mod;  // 选择余数，否则选择商
 wire [ 1:0] ID_mem_size;    // 00为字，01为字节，10为半字
 wire        ID_load_u;      // 进行零扩展
+wire        ID_is_rdcntvl;  // EX读取64位计时器的低32位
+wire        ID_is_rdcntvh;  // EX读取64位计时器的高32位
 
 // 以下是随指令传递的操作标记/数据，真正的CSR访问使能到WB再用valid限定。
-wire        ID_csr_re;       // 三条CSR指令均读旧值，并将旧值写回rd
+wire        ID_csr_re;       // 三条CSR指令和rdcntid均在WB读取CSR并写回通用寄存器
 wire        ID_csr_we;       // csrwr、csrxchg需要更新CSR
-wire [`CSR_NUM_WD-1:0] ID_csr_num; // 从inst[23:10]提取的CSR编号
+wire [`CSR_NUM_WD-1:0] ID_csr_num; // CSR指令取inst[23:10]，rdcntid固定读取TID
 wire [31:0] ID_csr_wmask;    // csrwr为全1；csrxchg取经过前递选择的GR[rj]
 wire [31:0] ID_csr_wvalue;   // 经过前递选择的GR[rd]，作为CSR写入数据
 wire        ID_is_ertn;      // 当前指令为ertn，到WB时据此产生ertn_flush
@@ -158,7 +160,9 @@ assign ID_to_EX_bus = {ID_pc,
                        ID_csr_wmask,
                        ID_csr_wvalue,
                        ID_is_ertn,
-                       ID_exception_flags};
+                       ID_exception_flags,
+                       ID_is_rdcntvl,
+                       ID_is_rdcntvh};
 
 
 // decode
@@ -246,7 +250,10 @@ wire        inst_ertn;
 wire        inst_csr;
 wire        inst_syscall;
 wire        inst_break;
-wire        inst_known;       // 当前真正实现的指令集合；合入rdcnt指令时需同步扩展
+wire        inst_rdcntvl_w;
+wire        inst_rdcntvh_w;
+wire        inst_rdcntid;
+wire        inst_known;     // 当前真正实现的指令集合，包含三条rdcnt指令
 wire        inst_ine;
 
 wire        inst_cond_branch;
@@ -374,15 +381,21 @@ assign inst_syscall = op_31_26_d[6'h00] & op_25_22_d[4'h0] & op_21_20_d[2'h2] & 
 // break与syscall只用高17位识别，低15位code不参与指令类型判断或异常子码生成。
 assign inst_break   = op_31_26_d[6'h00] & op_25_22_d[4'h0] & op_21_20_d[2'h2] & op_19_15_d[5'h14];
 
-assign inst_known   = inst_add_w    | inst_sub_w     | inst_slt         | inst_sltu     |
-                      inst_nor      | inst_and       | inst_or          | inst_xor      |
-                      inst_slli_w   | inst_srli_w    | inst_srai_w      | inst_addi_w   |
-                      inst_lu12i_w  | inst_pcaddu12i | inst_slti        | inst_sltui    |
-                      inst_andi     | inst_ori       | inst_xori        | inst_sll_w    | inst_srl_w | inst_sra_w   |
-                      inst_mul      | inst_mulh      | inst_mulhu       |
-                      inst_div_w    | inst_div_wu    | inst_mod_w       | inst_mod_wu   |
-                      inst_load     | inst_store     | inst_cond_branch | inst_jirl     | inst_b     | inst_bl      |
-                      inst_csr      | inst_ertn      | inst_syscall     | inst_break;
+// rj和rd同时为0的重叠编码按rdcntvl处理，结果写r0被丢弃，不产生软件可见差异。
+assign inst_rdcntvl_w = op_31_26_d[6'h00] & op_25_22_d[4'h0] & op_21_20_d[2'h0] & op_19_15_d[5'h00] & (rk == 5'h18) & (rj == 5'b0);
+assign inst_rdcntvh_w = op_31_26_d[6'h00] & op_25_22_d[4'h0] & op_21_20_d[2'h0] & op_19_15_d[5'h00] & (rk == 5'h19) & (rj == 5'b0);
+assign inst_rdcntid   = op_31_26_d[6'h00] & op_25_22_d[4'h0] & op_21_20_d[2'h0] & op_19_15_d[5'h00] & (rk == 5'h18) & (rd == 5'b0) & (rj != 5'b0);
+
+assign inst_known   = inst_add_w     | inst_sub_w     | inst_slt         | inst_sltu     |
+                      inst_nor       | inst_and       | inst_or          | inst_xor      |
+                      inst_slli_w    | inst_srli_w    | inst_srai_w      | inst_addi_w   |
+                      inst_lu12i_w   | inst_pcaddu12i | inst_slti        | inst_sltui    |
+                      inst_andi      | inst_ori       | inst_xori        | inst_sll_w    | inst_srl_w | inst_sra_w   |
+                      inst_mul       | inst_mulh      | inst_mulhu       |
+                      inst_div_w     | inst_div_wu    | inst_mod_w       | inst_mod_wu   |
+                      inst_load      | inst_store     | inst_cond_branch | inst_jirl     | inst_b     | inst_bl      |
+                      inst_csr       | inst_ertn      | inst_syscall     | inst_break    |
+                      inst_rdcntvl_w | inst_rdcntvh_w | inst_rdcntid;
 assign inst_ine     = !inst_known;
 // 这里只附加异常信息，真正报告在WB。ADEF对应的RAM数据可无意义，不能据此正常执行。
 // INT优先于ADEF；ID的INE/BRK/SYS互斥，ALE留给EX检测。
@@ -394,13 +407,15 @@ assign ID_has_exception = ID_exception_flags[`EXC_INT]  |
                           ID_exception_flags[`EXC_SYS]  |
                           ID_exception_flags[`EXC_ALE];
 
-assign ID_csr_re     = inst_csr && !ID_has_exception;
+assign ID_csr_re     = (inst_csr | inst_rdcntid) && !ID_has_exception;  // rdcntid复用WB读CSR的通路
 assign ID_csr_we     = (inst_csrwr | inst_csrxchg) && !ID_has_exception;
-assign ID_csr_num    = inst[23:10];
+assign ID_csr_num    = inst_rdcntid ? `CSR_TID : inst[23:10];           // 计时器编号来自TID
 // 仅CSR写指令使用掩码/写入值；其余指令无需将这些字段置零，由WB的csr_we屏蔽。
 assign ID_csr_wmask  = inst_csrxchg ? rj_value : 32'hffffffff;
 assign ID_csr_wvalue = rkd_value;
 assign ID_is_ertn    = inst_ertn && !ID_has_exception;
+assign ID_is_rdcntvl = inst_rdcntvl_w && !ID_has_exception;
+assign ID_is_rdcntvh = inst_rdcntvh_w && !ID_has_exception;
 
 assign inst_cond_branch = inst_beq  | inst_bne  | inst_blt  | inst_bge   | inst_bltu  | inst_bgeu;
 assign inst_store       = inst_st_w | inst_st_b | inst_st_h;
@@ -470,7 +485,9 @@ assign dst_is_r1        = inst_bl;
 // 涉及寄存器堆写操作
 assign gr_we            = ~inst_store & ~inst_cond_branch & ~inst_b & ~inst_ertn & ~inst_syscall & ~inst_break & ~inst_ine;
 assign mem_we           = inst_store;
-assign ID_dest          = dst_is_r1 ? 5'd1 : rd;
+assign ID_dest          = dst_is_r1    ? 5'd1 : 
+                          inst_rdcntid ? rj   : 
+                                         rd   ;    // rdcntid写rj，其余rdcnt指令写rd
 assign ID_rf_we         = gr_we && ID_valid && !ID_has_exception;
 
 assign rf_raddr1 = rj;

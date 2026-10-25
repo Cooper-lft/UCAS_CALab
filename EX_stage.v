@@ -105,6 +105,19 @@ wire [`EXCEPTION_BUS_WD-1:0] EX_exception_flags;    // 合入本拍ALE后的完�
 wire        EX_ale;
 wire        EX_has_exception;
 wire        EX_request_allowed; // 本拍允许访存或启动除法；地址和数据无需因取消而清零
+wire        EX_is_rdcntvl;
+wire        EX_is_rdcntvh;
+reg  [63:0] timer_64;           // 独立递增计时器，复位为0，流水停顿和异常清空不影响计时
+wire [31:0] EX_cnt_res;         // 计时器高低32位选择结果
+
+// 教材7.4：使用流水线时钟计时，每拍加1；不受TCFG、TICLR或流水级valid控制。
+always @(posedge clk) begin
+    if (reset)
+        timer_64 <= 64'b0;
+    else
+        timer_64 <= timer_64 + 1'b1;
+end
+assign EX_cnt_res = EX_is_rdcntvh ? timer_64[63:32] : timer_64[31:0];
 
 // 教材7.3.1.2：在EX发请求之前判断ALE。字访问检查低两位，半字检查最低位，字节无需对齐。
 assign EX_ale = EX_mem_en && (((EX_mem_size == 2'b00) && (EX_alu_res[1] | EX_alu_res[0])) ||
@@ -160,7 +173,10 @@ assign EX_to_MEM_bus    = {EX_pc,
                             EX_alu_res          // 完整有效地址随指令传递，供ALE更新BADV
                             };
 
-assign EX_wdata         = (EX_is_div)? div_result : EX_alu_res;
+assign EX_wdata     = (EX_is_rdcntvl || EX_is_rdcntvh) ? EX_cnt_res :
+                      (EX_is_div                       ? div_result :
+                                                         EX_alu_res);
+
 assign {EX_pc,
         EX_rf_we,
         EX_dest,
@@ -182,7 +198,9 @@ assign {EX_pc,
         EX_csr_wmask,
         EX_csr_wvalue,
         EX_is_ertn,
-        EX_exception_flags_in}    = EX_data;
+        EX_exception_flags_in,
+        EX_is_rdcntvl,
+        EX_is_rdcntvh}    = EX_data;
 
 assign EX_store_mask        = (EX_mem_size == 2'b01) ? (4'b0001 << EX_alu_res[1:0]) :
                               (EX_mem_size == 2'b10) ? (EX_alu_res[1] ? 4'b1100 : 4'b0011) :
@@ -204,7 +222,7 @@ assign  es_valid    = EX_valid;
 assign  es_rf_we    = EX_rf_we && !EX_has_exception;
 assign  es_dest     = EX_dest;
 
-// 向ID报告结果尚未就绪的指令：load要等MEM，CSR要等WB。
+// 向ID报告结果尚未就绪的指令：load要等MEM，CSR和复用CSR读通路的rdcntid要等WB。
 // 根据指令属性判断load，避免将是否允许发出访存请求混入类型判断。
 assign  load_in_EX          = EX_valid && EX_sel_rf_res && !EX_has_exception;
 assign  EX_wdata_forward    = EX_wdata;

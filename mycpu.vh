@@ -17,10 +17,10 @@
 `define EXC_SYS             1
 `define EXC_ALE             0
 // 原总线字段宽度 + CSR附加信息；146表示ID总线中除ALU控制向量外的原字段总宽度。
-// IF->ID为65位：原PC/指令加ADEF。ID->EX、EX->MEM、MEM->WB为248、195、189位。
+// IF->ID为65位；ID->EX新增rdcntvl/rdcntvh标记后为250位，EX->MEM、MEM->WB仍为195、189位。
 // EX之后另带完整32位数据访存地址，不能用load结果或地址低两位替代BADV输入。
 `define IF_TO_ID_BUS_WD     (64 + 1)
-`define ID_TO_EX_BUS_WD     (146 + `ALU_OP_WD + `CSR_BUS_WD + `EXCEPTION_BUS_WD)
+`define ID_TO_EX_BUS_WD     (146 + `ALU_OP_WD + `CSR_BUS_WD + `EXCEPTION_BUS_WD + 2)
 `define EX_TO_MEM_BUS_WD    (76 + `CSR_BUS_WD + `EXCEPTION_BUS_WD + 32)
 `define MEM_TO_WB_BUS_WD    (70 + `CSR_BUS_WD + `EXCEPTION_BUS_WD + 32)
 
