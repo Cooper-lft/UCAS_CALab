@@ -63,11 +63,12 @@ wire        ID_interrupt;
 wire        ID_has_exception;
 wire [`EXCEPTION_BUS_WD-1:0] ID_exception_flags;
 // 用于解决时序违例，而让涉及前递的跳转指令阻塞在ID级直到EX级指令流入MEM级
+// 本次将等待延长到WB，同时阻塞EX、MEM中的相关写寄存器指令。
 wire        br_block;
 wire        br_need_rj;
 wire        br_need_rd;
-wire [31:0] rj_value_mem_wb;
-wire [31:0] rkd_value_mem_wb;
+wire [31:0] rj_value_wb;
+wire [31:0] rkd_value_wb;
 
 // WB级前递的数据：
 wire [31:0] WB_wdata_forward;
@@ -504,9 +505,9 @@ regfile u_regfile(
     );
 
 
-assign rj_eq_rd  = (rj_value_mem_wb == rkd_value_mem_wb);
-assign rj_lt_rd  = ($signed(rj_value_mem_wb) < $signed(rkd_value_mem_wb));
-assign rj_ltu_rd = (rj_value_mem_wb < rkd_value_mem_wb);
+assign rj_eq_rd  = (rj_value_wb == rkd_value_wb);
+assign rj_lt_rd  = ($signed(rj_value_wb) < $signed(rkd_value_wb));
+assign rj_ltu_rd = (rj_value_wb < rkd_value_wb);
 assign br_taken  = (   inst_beq  &&  rj_eq_rd
                     || inst_bne  &&  !rj_eq_rd
                     || inst_blt  &&  rj_lt_rd
@@ -518,14 +519,11 @@ assign br_taken  = (   inst_beq  &&  rj_eq_rd
                     || inst_b
                    ) && ID_valid && ID_readygo && EX_allowin && !ID_has_exception; // 只有正常指令有效发射时才能改变取指PC；中断标记同样禁止跳转
 assign br_target = (inst_cond_branch || inst_bl || inst_b) ? (ID_pc + br_offs) :
-                                                   /*inst_jirl*/ (rj_value_mem_wb + jirl_offs);
+                                                   /*inst_jirl*/ (rj_value_wb + jirl_offs);
 // 复用原有MEM,WB前递通路，涉及前递的跳转指令的寄存器值只用MEM,WB级前递结果和寄存器堆的结果，不用EX级结果，避免时序违例
-assign rj_value_mem_wb  = (MEM_forward_src1) ? MEM_wdata_forward :
-                          (WB_forward_src1 ) ? WB_wdata_forward  :
-                           rf_rdata1;
-assign rkd_value_mem_wb = (MEM_forward_src2) ? MEM_wdata_forward :
-                          (WB_forward_src2 ) ? WB_wdata_forward  :
-                           rf_rdata2;
+// 在上述方案上进一步去掉MEM前递，分支比较和jirl目标只选择WB结果或寄存器堆。
+assign rj_value_wb  = WB_forward_src1 ? WB_wdata_forward : rf_rdata1;
+assign rkd_value_wb = WB_forward_src2 ? WB_wdata_forward : rf_rdata2;
 
 assign ID_alu_src1 = (src1_is_pc) ? ID_pc[31:0] : 
                      (src1_is_0 ) ? 32'b0 : rj_value;
@@ -571,10 +569,15 @@ assign  br_need_rj = inst_cond_branch || inst_jirl;
 // 跳转指令中需要rd前递结果的
 assign  br_need_rd = inst_cond_branch;
 // 如果涉及前递的跳转指令需要当前EX级的前递结果，则让ID级跳转指令阻塞
-assign  br_block   = ID_valid && EX_valid && EX_rf_we && (EX_dest != 5'b0) &&
-                     ( (br_need_rj && (EX_dest == rj)) ||
-                       (br_need_rd && (EX_dest == rd)) 
-                     ); 
+// MEM中的相关指令也必须等待，防止读到寄存器堆或WB中更旧的值。
+assign  br_block   = ID_valid && (
+                     (EX_valid && EX_rf_we && (EX_dest != 5'b0) &&
+                      ((br_need_rj && (EX_dest == rj)) ||
+                       (br_need_rd && (EX_dest == rd)))) ||
+                     (MEM_valid && MEM_rf_we && (MEM_dest != 5'b0) &&
+                      ((br_need_rj && (MEM_dest == rj)) ||
+                       (br_need_rd && (MEM_dest == rd))))
+                     );
 
 assign rj_used = inst_add_w         |
                  inst_sub_w         |
